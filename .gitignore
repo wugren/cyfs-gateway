@@ -36,3 +36,6 @@ src/local_rootfs
 uv.lock
 *.egg-info
 src/apps/cyfs_gateway/acme_account.json
+acme_account.json
+src/web3-gateway/bns_dv
+src/deno.lock

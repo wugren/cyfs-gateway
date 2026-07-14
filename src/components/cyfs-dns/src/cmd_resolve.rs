@@ -393,8 +393,7 @@ impl ExternalCommand for CmdResolve {
 mod tests {
     use super::*;
     use cyfs_process_chain::{
-        CommandPipe, Context as ChainContext, Env, EnvLevel, GotoCounter,
-        ProcessChainLinkedManager,
+        CommandPipe, Context as ChainContext, Env, EnvLevel, GotoCounter, ProcessChainLinkedManager,
     };
     use std::sync::Arc;
 
@@ -440,11 +439,9 @@ mod tests {
             CommandPipe::default(),
         );
 
-        assert!(
-            !should_suppress_loopback_recursion(&context, "127.0.0.1")
-                .await
-                .unwrap()
-        );
+        assert!(!should_suppress_loopback_recursion(&context, "127.0.0.1")
+            .await
+            .unwrap());
 
         env.create(
             "REQ_dns_authoritative",
@@ -453,15 +450,11 @@ mod tests {
         .await
         .unwrap();
 
-        assert!(
-            should_suppress_loopback_recursion(&context, "127.0.0.1")
-                .await
-                .unwrap()
-        );
-        assert!(
-            !should_suppress_loopback_recursion(&context, "8.8.8.8")
-                .await
-                .unwrap()
-        );
+        assert!(should_suppress_loopback_recursion(&context, "127.0.0.1")
+            .await
+            .unwrap());
+        assert!(!should_suppress_loopback_recursion(&context, "8.8.8.8")
+            .await
+            .unwrap());
     }
 }

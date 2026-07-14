@@ -1,0 +1,299 @@
+collections:
+  test_set:
+    type: memory_set
+  test_map:
+    type: memory_map
+  test_json_set:
+    type: json_set
+    file_path: {{test_json_set}}
+  test_json_map:
+    type: json_map
+    file_path: {{test_json_map}}
+  test_sqlite_set:
+    type: sqlite_set
+    file_path: {{test_sqlite_set}}
+  test_sqlite_map:
+    type: sqlite_map
+    file_path: {{test_sqlite_map}}
+  test_text_set:
+    type: text_set
+    file_path: {{test_text_set}}
+
+js_externals:
+  test_js_hook: {{test_js_hook_file}}
+
+limiters:
+  test:
+    upper_limiter: global
+    download_limit: 1MB/s
+    upload_limit: 1MB/s
+    concurrent: 256
+
+  global:
+    download_limit: 1GB/s
+    upload_limit: 1GB/s
+    concurrent: 2048
+
+stacks:
+  __control_server__:
+    bind: 127.0.0.1:{{control_server_port}}
+
+  test1:
+    bind: 0.0.0.0:18080
+    protocol: tcp
+    io_dump_file: {{test_io_dump}}
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              set-add test_set ${REQ.dest_host};
+              set-add test_json_set ${REQ.dest_host};
+              set-add test_sqlite_set ${REQ.dest_host};
+              set-add test_text_set ${REQ.dest_host};
+              map-add test_map ${REQ.dest_host} 1;
+              map-add test_json_map ${REQ.dest_host} 1;
+              map-add test_sqlite_map ${REQ.dest_host} 1;
+              test_js_hook ${REQ.dest_host} && http-probe && call-server ${REQ.dest_host};
+              reject;
+
+  test2:
+    bind: 0.0.0.0:18081
+    protocol: tcp
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              exec --lib global_test1;
+              http-probe && call-server ${REQ.dest_host};
+              reject;
+
+  socks_stack:
+    bind: 127.0.0.1:{{socks_stack_port}}
+    protocol: tcp
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server socks_proxy;
+
+  upstream_socks_stack:
+    bind: 127.0.0.1:{{upstream_socks_stack_port}}
+    protocol: tcp
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server upstream_socks;
+
+  test3:
+    bind: 0.0.0.0:9545
+    protocol: udp
+    transparent: false
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server main_dns;
+
+  test_ptcp_entry:
+    bind: 0.0.0.0:18082
+    protocol: tcp
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              http-probe && forward "ptcp://${REQ.source_addr}/127.0.0.1:18084";
+              reject;
+
+  test_ptcp_mix:
+    bind: 0.0.0.0:18084
+    protocol: tcp
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              proxy-protocol-probe && echo ${REQ.ext.proxy_source_addr};
+              http-probe && call-server ${REQ.dest_host};
+              reject;
+
+servers:
+  web3.buckyos.com:
+    type: http
+    hook_point:
+      main:
+        priority: 0
+        blocks:
+          default:
+            priority: 1
+            block: |
+              starts-with ${REQ.path} "/api" && rewrite ${REQ.path} "/api*" "*" && map-add REQ host www.buckyos.com && forward http://127.0.0.1:18081;
+      main1:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              starts-with ${REQ.path} "/test_return" && rewrite ${REQ.path} "/test_return*" "*" && map-add REQ host www.buckyos.com && return "forward http://127.0.0.1:18081";
+              starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "/*" && call-server sn.http;
+
+          default1:
+            priority: 2
+            block: |
+              call-server web3_dir;
+    post_hook_point:
+      main:
+        priority: 0
+        blocks:
+          default:
+            priority: 1
+            block: |
+              map-add RESP x-test "1";
+
+  www.buckyos.com:
+    type: http
+    gzip: true
+    gzip_vary: true
+    gzip_types:
+      - text/html
+      - text/css
+      - application/javascript
+      - application/json
+      - application/xml
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server www_dir;
+
+  ptcp-direct.buckyos.com:
+    type: http
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              call-server www_dir;
+
+  ptcp-probe.buckyos.com:
+    type: http
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              echo ${REQ_remote_ip};
+              echo ${REQ_remote_port};
+              call-server www_dir;
+    post_hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              map-add RESP x-remote-port ${REQ_remote_port};
+              map-add RESP x-conn-remote-port ${REQ_conn_remote_port};
+              map-add RESP x-real-remote-port ${REQ_real_remote_port};
+
+  web3_dir:
+    type: dir
+    root_path: {{web3_dir}}
+
+  www_dir:
+    type: dir
+    root_path: {{www_dir}}
+
+  main_dns:
+    type: dns
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              resolve ${REQ.name} ${REQ.record_type} local_dns && return;
+              resolve ${REQ.name} ${REQ.record_type} "223.5.5.5:53" && return;
+
+  sn:
+    type: sn
+    host: web3.buckyos.io
+    ip: 127.0.0.1
+    boot_jwt: "eyJhbGciOiJFZERTQSJ9.eyJvb2RzIjpbInNuIl0sImV4cCI6MjA1ODgzODkzOX0.SGem2FBRB0H2TcRWBRJCsCg5PYXzHW9X9853UChV_qzWHHhKxunZ-emotSnr9HufjL7avGEos1ifRjl9KTrzBg"
+    owner_pkx: "qJdNEtscIYwTo-I0K7iPEt_UZdBDRd4r16jdBfNR0tM"
+    device_jwt: ["eyJhbGciOiJFZERTQSJ9.eyJuIjoic24iLCJ4IjoiRlB2WTNXWFB4dVdQWUZ1d09ZMFFiaDBPNy1oaEtyNnRhMWpUY1g5T1JQSSIsImV4cCI6MjA1ODgzODkzOX0._YKR0y6E4JQJXDEG12WWFfY1pXyxtdSuigERZQXphnQAarDM02JIoXLNtad80U7T7lO_A4z_HbNDRJ9hMGKhCA"]
+    db_type: sqlite
+    db_path: {{sn_db}}
+
+  socks_proxy:
+    type: socks
+    username: {{socks_user}}
+    password: {{socks_pass}}
+    target: socks://{{upstream_socks_user}}:{{upstream_socks_pass}}@127.0.0.1:{{upstream_socks_stack_port}}
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              eq ${REQ.target.port} "{{echo_direct_port}}" && return "DIRECT";
+              eq ${REQ.target.port} "{{echo_proxy_port}}" && return "PROXY";
+              reject;
+
+  upstream_socks:
+    type: socks
+    username: {{upstream_socks_user}}
+    password: {{upstream_socks_pass}}
+    target: http://127.0.0.1:0
+    hook_point:
+      main:
+        priority: 1
+        blocks:
+          default:
+            priority: 1
+            block: |
+              eq ${REQ.target.port} "{{echo_proxy_port}}" && set-add test_json_set upstream_socks_hit && return "DIRECT";
+              reject;
+
+
+  local_dns:
+    type: local_dns
+    file_path: {{local_dns}}
+
+global_process_chains:
+  global_test1:
+    priority: 1
+    blocks:
+      default:
+        priority: 1
+        block: |
+          echo "hello global_test1";

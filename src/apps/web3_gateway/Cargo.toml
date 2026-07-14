@@ -1,0 +1,62 @@
+[package]
+name = "web3_gateway"
+version.workspace = true
+edition = "2021"
+build = "build.rs"
+
+[dependencies]
+thiserror.workspace = true
+log.workspace = true
+url.workspace = true
+tokio = { version = "*", features = ["full","tracing"] }
+console-subscriber = { version = "*" }
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+lazy_static.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+bytes.workspace = true
+dirs = "*"
+once_cell.workspace = true
+anyhow.workspace = true
+serde_yaml_ng.workspace = true
+sfo-result = "0.2.16"
+sha2.workspace = true
+chrono.workspace = true
+async-recursion = "*"
+toml.workspace = true
+hex.workspace = true
+jsonwebtoken.workspace = true
+sfo-io = "0.1.12"
+buckyos-kit.workspace = true
+name-client.workspace = true
+name-lib.workspace = true
+kRPC.workspace = true
+
+cyfs-gateway-lib = { path = "../../components/cyfs-gateway-lib" }
+cyfs-gateway-app-lib = { path = "../../components/cyfs-gateway-app-lib" }
+cyfs-process-chain = { path = "../../components/cyfs-process-chain" }
+cyfs-acme = { path = "../../components/cyfs-acme" }
+cyfs-sn = { path = "../../components/cyfs-sn" }
+cyfs-dns = { path = "../../components/cyfs-dns" }
+cyfs-socks = { path = "../../components/cyfs-socks" }
+cyfs-tun = { path = "../../components/cyfs-tun"}
+cyfs-traffic = { path = "../../components/cyfs-traffic" }
+http-body-util.workspace = true
+http.workspace = true
+shlex.workspace = true
+sfo-js = { version = "0.1.8" }
+rand = "0.9.2"
+reqwest.workspace = true
+httpdate = "1.0"
+
+[dev-dependencies]
+tempfile.workspace = true
+hyper = { version = "1.8", features = ["full"] }
+hyper-util.workspace = true
+http-body-util.workspace = true
+hickory-resolver = { version = "0.24", features = ["tokio"] }
+async-compression = { version = "0.4", features = ["tokio", "gzip", "deflate", "brotli"] }
+bns-indexer = { path = "../../components/bns-indexer" }
+bns-server = { path = "../../components/bns-server" }

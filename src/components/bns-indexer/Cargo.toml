@@ -6,13 +6,18 @@ authors = ["BuckyOS DAO", "@waterflier", "@lurenpluto", "@wugren"]
 
 [dependencies]
 async-trait.workspace = true
+bns-client = { path = "../bns-client" }
+bns-evm = { path = "../bns-evm" }
 hex.workspace = true
 rusqlite = { version = "0.32.1", features = ["bundled"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
+ndn-lib.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
+serde_json.workspace = true
+alloy-sol-types = { version = "1.6.0", features = ["json"] }

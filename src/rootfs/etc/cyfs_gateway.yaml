@@ -15,6 +15,10 @@
 #   geo_block: ./scripts/geo_block.js
 #   custom_auth: ./scripts/custom_auth.js
 
+# identity_manager:      # Gateway-wide identity store for ACME, TLS, QUIC, and RTCP identity loading
+#   public_root_path: ./identity
+#   security_root_path: ./security
+
 # timers:               # periodic process-chain tasks (optional)
 #   clean_cache:
 #     timeout: 300      # seconds, must be > 0
@@ -50,9 +54,7 @@
 #       dns_provider: sn-dns
 #   check_interval: 43200          # certificate check interval (seconds), default 12h
 #   renew_before_expiry: 604800    # renew ahead of expiry (seconds), default 7d
-#   identity_manager:              # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security
-#     public_root_path: ./identity
-#     security_root_path: ./security
+#   # identity_manager is optional here; defaults to the Gateway-wide identity_manager above
 
 # tls_ca:             # self-signed/CA certificate config (optional)
 #   cert_path: ./ca.crt
@@ -157,7 +159,10 @@ stacks:
     #   hosts: # TLS identities supported by this stack; certs are loaded through the identity manager path protocol
     #     - example.com
     #     - "*.example.org"
-    #   identity_manager: # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security
+    #     - host: cert.example.net # operator-managed certificate loaded directly from absolute paths
+    #       cert_path: /etc/ssl/certs/cert.example.net.fullchain.pem
+    #       key_path: /etc/ssl/private/cert.example.net.key
+    #   identity_manager: # optional stack-level override; prefer the Gateway-wide identity_manager
     #     public_root_path: ./identity
     #     security_root_path: ./security
     #   hook_point: { }
@@ -174,7 +179,7 @@ stacks:
     #   hosts: # QUIC identities supported by this stack; certs are loaded through the identity manager path protocol
     #     - example.com
     #     - "*.example.org"
-    #   identity_manager: # optional; defaults to BUCKYOS_IDENTITY_ROOT/BUCKYOS_SECURITY_ROOT or $BUCKYOS_ROOT/local/identity and $BUCKYOS_ROOT/security
+    #   identity_manager: # optional stack-level override; prefer the Gateway-wide identity_manager
     #     public_root_path: ./identity
     #     security_root_path: ./security
     #   hook_point: { }
@@ -182,9 +187,15 @@ stacks:
     # rtcp_example:
     #   protocol: rtcp
     #   bind: 0.0.0.0:2980
-    #   key_path: ./sn_private_key.pem
-    #   device_config_path: ./device.doc.jwt  # 也支持 JSON；只有配置 JWT 时，Hello 才会自动携带 device_doc_jwt
-    #   name: optional_name
+    #   identity: did:web:device.example.com # preferred; loads device identity from identity_manager roots
+    #   identity_manager: # optional stack-level override; prefer the Gateway-wide identity_manager
+    #     public_root_path: ./identity
+    #     security_root_path: ./security
+    #   # Legacy explicit identity config is still supported:
+    #   # key_path: ./sn_private_key.pem
+    #   # device_config_path: ./device.doc.jwt  # did:dev 可用 JSON；逻辑 DID 必须配置 JWT，Hello 会携带 device_doc_jwt
+    #   # device_doc_jwt: <owner-signed-device-doc-jwt> # optional inline alternative to device_config_path/device.doc.jwt
+    #   # name: optional_name
     #   reuse_address: false
     #   io_dump_file: rtcp.dump
     #   stream_idle_timeout: 600    # stream forwarding idle timeout (seconds), default 600
@@ -286,6 +297,11 @@ stacks:
   #   device_jwt:
   #     - "<jwt>"
   #   aliases: []                 # optional
+  #   bns_rpc_url: http://127.0.0.1:13450  # required unified /kapi/bns RPC
+  #   bns_evm:                    # legacy single-controller key source
+  #     controller_private_key_env: BNS_PRIVATE_KEY
+  #   bns_proxy:                  # required registration/write capability
+  #     require_user_asset_owner: true
   #   db_type: sqlite             # optional
   #   db_params:
   #     db_path: ./sn.db

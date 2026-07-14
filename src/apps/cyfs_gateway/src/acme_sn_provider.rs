@@ -2,9 +2,9 @@ use anyhow::anyhow;
 use cyfs_acme::{
     AcmeCertManager, AcmeCertManagerRef, DnsProvider, DnsProviderFactory, DnsProviderRef,
 };
+use cyfs_gateway_api::generate_sn_device_token;
 use cyfs_gateway_lib::{RtcpStackConfig, StackProtocol};
 use cyfs_sn::OODInfo;
-use kRPC::RPCSessionToken;
 use name_lib::{
     DID, DeviceConfig, encode_ed25519_pkcs8_sk_to_pk, get_x_from_jwk, load_raw_private_key,
 };
@@ -21,11 +21,17 @@ pub struct AcmeSnProviderFactory {
 
 fn normalize_sn_rpc_url(sn: &str) -> String {
     let sn = sn.trim().trim_end_matches('/');
-    if sn.ends_with("/kapi/sn") {
-        sn.to_string()
-    } else {
-        format!("{}/kapi/sn", sn)
+    for suffix in [
+        "/kapi/sn/deviceinfo",
+        "/kapi/sn/auth",
+        "/kapi/sn/bns",
+        "/kapi/sn",
+    ] {
+        if let Some(base) = sn.strip_suffix(suffix) {
+            return base.to_string();
+        }
     }
+    sn.to_string()
 }
 
 impl AcmeSnProviderFactory {
@@ -39,6 +45,7 @@ pub struct AcmdSnProviderConfig {
     pub sn: String,
     pub key_path: String,
     pub device_config_path: Option<String>,
+    pub access_token: Option<String>,
 }
 
 #[async_trait::async_trait]
@@ -92,7 +99,31 @@ impl DnsProviderFactory for AcmeSnProviderFactory {
             }
             device_config
         } else {
-            DeviceConfig::new("cyfs_gateway", public_key)
+            return Err(anyhow!(
+                "device_config_path is required for unattended SN authentication"
+            ));
+        };
+        let device_key_did = DID::new("dev", public_key.as_str());
+        let device_scoped_did = match device_config.id.method.as_str() {
+            "web" | "bns" => device_config.id.clone(),
+            "dev" => {
+                let zone = device_config
+                    .zone_did
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("device config with did:dev id is missing zone_did"))?;
+                if !matches!(zone.method.as_str(), "web" | "bns") || device_config.name.is_empty() {
+                    return Err(anyhow!(
+                        "cannot derive zone-scoped device DID from zone_did {:?} and name {:?}",
+                        zone,
+                        device_config.name
+                    ));
+                }
+                DID::new(
+                    zone.method.as_str(),
+                    format!("{}.{}", device_config.name, zone.id).as_str(),
+                )
+            }
+            method => return Err(anyhow!("unsupported device DID method {}", method)),
         };
         let private_key = jsonwebtoken::EncodingKey::from_ed_der(private_key.as_slice());
 
@@ -101,8 +132,9 @@ impl DnsProviderFactory for AcmeSnProviderFactory {
             acme_mgr,
             normalize_sn_rpc_url(config.sn.as_str()),
             private_key,
-            device_config.id,
-            device_config.name,
+            device_key_did,
+            device_scoped_did,
+            config.access_token,
         ))
     }
 }
@@ -120,7 +152,8 @@ struct AcmeSnProvider {
     sn: String,
     private_key: jsonwebtoken::EncodingKey,
     did: DID,
-    user_name: String,
+    device_scoped_did: DID,
+    access_token: Option<String>,
     cert_state_cache: Mutex<Vec<CertStateItem>>,
     handle: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -140,7 +173,8 @@ impl AcmeSnProvider {
         sn: String,
         private_key: jsonwebtoken::EncodingKey,
         did: DID,
-        user_name: String,
+        device_scoped_did: DID,
+        access_token: Option<String>,
     ) -> Arc<AcmeSnProvider> {
         let this = Arc::new(AcmeSnProvider {
             data_path,
@@ -148,7 +182,8 @@ impl AcmeSnProvider {
             sn,
             private_key,
             did,
-            user_name,
+            device_scoped_did,
+            access_token,
             cert_state_cache: Mutex::new(Default::default()),
             handle: Mutex::new(None),
         });
@@ -230,45 +265,48 @@ impl AcmeSnProvider {
         }
         Ok(())
     }
-    fn get_krpc_for_route(&self, route: Option<&str>) -> anyhow::Result<kRPC::kRPC> {
-        let (token, _) = RPCSessionToken::generate_jwt_token(
-            self.user_name.as_str(),
-            "cyfs_gateway",
-            None,
-            &self.private_key,
-        )
-        .map_err(|_| anyhow!("generate jwt token failed"))?;
-        let url = match route {
-            Some(route) if !route.is_empty() => {
-                format!("{}/{}", self.sn.trim_end_matches('/'), route)
-            }
-            _ => self.sn.clone(),
+    fn get_krpc_for_route(&self, route: &str) -> anyhow::Result<kRPC::kRPC> {
+        let token = if let Some(access_token) = self.access_token.clone() {
+            access_token
+        } else {
+            generate_sn_device_token(
+                self.did.to_string().as_str(),
+                self.device_scoped_did.to_string().as_str(),
+                None,
+                &self.private_key,
+            )
+            .map_err(|e| anyhow!("generate SN device token failed: {}", e))?
         };
+        let url = format!(
+            "{}/{}",
+            self.sn.trim_end_matches('/'),
+            route.trim_start_matches('/')
+        );
         let krpc = kRPC::kRPC::new(url.as_str(), Some(token));
         Ok(krpc)
     }
 
     async fn report_user_cert_ok(&self) -> anyhow::Result<()> {
-        let root_krpc = self.get_krpc_for_route(None)?;
-        let result = root_krpc
+        let deviceinfo_krpc = self.get_krpc_for_route("/kapi/sn/deviceinfo")?;
+        let result = deviceinfo_krpc
             .call(
-                "query_by_did",
+                "deviceinfo.resolve_ood_by_did",
                 json!({
                     "source_device_id": self.did.to_string()
                 }),
             )
             .await
-            .map_err(|e| anyhow!("query_by_hostname failed.{:?}", e))?;
-        let ood_info = serde_json::from_value::<OODInfo>(result)
-            .map_err(|_| anyhow!("parse query_by_hostname result failed"))?;
+            .map_err(|e| anyhow!("resolve_ood_by_did failed.{:?}", e))?;
+        let _ood_info = serde_json::from_value::<OODInfo>(result)
+            .map_err(|_| anyhow!("parse resolve_ood_by_did result failed"))?;
 
-        let bns_krpc = self.get_krpc_for_route(Some("bns"))?;
-        bns_krpc
+        let auth_krpc = self.get_krpc_for_route("/kapi/sn/auth")?;
+        auth_krpc
             .call(
-                "set_user_self_cert",
+                "user.set_self_cert",
                 json!({
-                    "name": ood_info.owner_id,
-                    "self_cert": true
+                    "self_cert": true,
+                    "device_did": self.did.to_string()
                 }),
             )
             .await
@@ -298,12 +336,12 @@ impl AcmeSnProvider {
 #[async_trait::async_trait]
 impl DnsProvider for AcmeSnProvider {
     async fn call(&self, op: String, domain: String, key_hash: String) -> anyhow::Result<()> {
-        let krpc = self.get_krpc_for_route(None)?;
+        let krpc = self.get_krpc_for_route("/kapi/sn/auth")?;
         if op == "add_challenge" {
             let original = domain.replace("_acme-challenge.", "*.");
             self.add_cert(original).await?;
             krpc.call(
-                "add_dns_record",
+                "user.add_dns_record",
                 json!({
                     "device_did": self.did.to_string(),
                     "domain": domain,
@@ -333,28 +371,30 @@ impl DnsProvider for AcmeSnProvider {
                 }
             }
             krpc.call(
-                "remove_dns_record",
+                "user.remove_dns_record",
                 json!({
                     "device_did": self.did.to_string(),
                     "domain": domain,
                     "record_type": "TXT",
+                    "record": key_hash,
                     "has_cert": has_cert,
                 }),
             )
             .await
-            .map_err(|e| anyhow!("add_dns_record failed.{:?}", e))?;
+            .map_err(|e| anyhow!("remove_dns_record failed.{:?}", e))?;
 
-            let result = krpc
+            let deviceinfo_krpc = self.get_krpc_for_route("/kapi/sn/deviceinfo")?;
+            let result = deviceinfo_krpc
                 .call(
-                    "query_by_did",
+                    "deviceinfo.resolve_ood_by_did",
                     json!({
                         "source_device_id": self.did.to_string()
                     }),
                 )
                 .await
-                .map_err(|e| anyhow!("query_by_hostname failed.{:?}", e))?;
+                .map_err(|e| anyhow!("resolve_ood_by_did failed.{:?}", e))?;
             let ood_info = serde_json::from_value::<OODInfo>(result)
-                .map_err(|_| anyhow!("parse query_by_hostname result failed"))?;
+                .map_err(|_| anyhow!("parse resolve_ood_by_did result failed"))?;
 
             if ood_info.self_cert {
                 self.set_cert_ok().await?;

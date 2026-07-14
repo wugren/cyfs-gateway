@@ -3,37 +3,38 @@
 
 mod acme_sn_provider;
 mod config_loader;
-mod config_merger;
-mod debug;
 mod gateway;
-mod gateway_control_server;
-mod process_chain_doc;
-mod socks;
 
-use crate::debug::run_debug_command;
 use acme_sn_provider::*;
 pub use config_loader::*;
-pub use config_merger::*;
-pub use gateway::*;
-pub use gateway_control_server::*;
-pub use cyfs_gateway_lib::{
-    CONTROL_SERVER, ControlError, ControlErrorCode, ControlResult, CyfsTokenFactory,
-    CyfsTokenVerifier, ExternalCmd, GatewayControlClient, GatewayControlCmdHandler, LoginReq,
-    cmd_err, into_cmd_err,
+pub use cyfs_gateway_app_lib::{
+    merge, run_debug_command, AcmeConfig, AcmeHostConfig, AcmeHttpChallengeServerConfigParser,
+    ConfigMerger, CyfsDirServerConfigParser, DirServerConfigParser, DnsServerConfigParser,
+    GatewayControlServer, GatewayControlServerConfig, GatewayControlServerConfigParser,
+    GatewayControlServerContext, GatewayControlServerFactory, GatewayProcessChainDoc,
+    HttpServerConfigParser, LocalDnsConfigParser, QuicStackConfigParser, RtcpStackConfigParser,
+    SocksServerConfigParser, TcpStackConfigParser, TlsCA, TlsStackConfigParser,
+    TunStackConfigParser, UdpStackConfigParser, GATEWAY_CONTROL_SERVER_CONFIG,
+    GATEWAY_CONTROL_SERVER_KEY,
 };
+pub use cyfs_gateway_lib::{
+    cmd_err, into_cmd_err, ControlError, ControlErrorCode, ControlResult, CyfsTokenFactory,
+    CyfsTokenVerifier, ExternalCmd, GatewayControlClient, GatewayControlCmdHandler, LoginReq,
+    CONTROL_SERVER,
+};
+pub use gateway::*;
 
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use console_subscriber::{self, Server};
 use cyfs_dns::{InnerDnsRecordManager, LocalDnsFactory, ProcessChainDnsServerFactory};
 use cyfs_gateway_lib::*;
-use process_chain_doc::GatewayProcessChainDoc;
 use std::collections::HashSet;
 
 use anyhow::anyhow;
 use anyhow::Result;
 use buckyos_kit::init_logging;
 use buckyos_kit::{get_buckyos_service_data_dir, get_buckyos_system_etc_dir};
-use cyfs_sn::{SnServerFactory, SqliteDBFactory};
+use cyfs_sn::SnServerFactory;
 use cyfs_socks::SocksServerFactory;
 use cyfs_tun::TunStackFactory;
 use kRPC::RPCSessionToken;
@@ -87,10 +88,7 @@ async fn run_gateway_with_config(
     parser.register_server_config_parser("socks", Arc::new(SocksServerConfigParser::new()));
     parser.register_server_config_parser("dns", Arc::new(DnsServerConfigParser::new()));
     parser.register_server_config_parser("dir", Arc::new(DirServerConfigParser::new()));
-    parser.register_server_config_parser(
-        "cyfs-dir",
-        Arc::new(CyfsDirServerConfigParser::new()),
-    );
+    parser.register_server_config_parser("cyfs-dir", Arc::new(CyfsDirServerConfigParser::new()));
     parser.register_server_config_parser(
         "control_server",
         Arc::new(GatewayControlServerConfigParser::new()),
@@ -217,9 +215,7 @@ async fn run_gateway_with_config(
     debug!("Register control server factory");
     factory.register_server_factory("local_dns", Arc::new(LocalDnsFactory::new()));
     debug!("Register local dns server factory");
-    let mut sn_factory = SnServerFactory::new();
-    sn_factory.register_db_factory("sqlite", SqliteDBFactory::new());
-    factory.register_server_factory("sn", Arc::new(sn_factory));
+    factory.register_server_factory("sn", Arc::new(SnServerFactory::new()));
     debug!("Register sn server factory");
     let gateway = factory
         .create_gateway(config_file, gateway_config, init_gateway_config)

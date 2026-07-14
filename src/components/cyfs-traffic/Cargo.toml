@@ -1,0 +1,25 @@
+[package]
+name = "cyfs-traffic"
+version.workspace = true
+edition = "2024"
+authors = ["BuckyOS DAO"]
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+hex.workspace = true
+hmac.workspace = true
+log.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sfo-io = "0.1.14"
+tokio.workspace = true
+url.workspace = true
+
+cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(coverage,coverage_nightly)'] }

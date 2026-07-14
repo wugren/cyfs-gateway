@@ -6,7 +6,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::{Arc, Mutex};
 use tokio::sync::RwLock;
 
-pub const STREAM_REQUEST_LEN: usize = 13;
+pub const STREAM_REQUEST_LEN: usize = 15;
 
 #[derive(Clone)]
 pub struct StreamRequest {
@@ -17,6 +17,12 @@ pub struct StreamRequest {
     pub dest_url: Option<String>,
 
     pub source_addr: Option<SocketAddr>,
+    /// Connection-layer direct previous hop, before PROXY protocol or any
+    /// trusted-upstream restore is applied.
+    pub conn_source_addr: Option<SocketAddr>,
+    /// Source restored through a trusted mechanism (PROXY protocol,
+    /// authenticated tunnel). Must stay `None` when no such mechanism ran.
+    pub real_source_addr: Option<SocketAddr>,
     pub source_mac: Option<String>,
     pub source_hostname: Option<String>,
     pub source_online_secs: Option<String>,
@@ -38,6 +44,8 @@ impl Default for StreamRequest {
             app_protocol: None,
             dest_url: None,
             source_addr: None,
+            conn_source_addr: None,
+            real_source_addr: None,
             source_mac: None,
             source_hostname: None,
             source_online_secs: None,
@@ -59,6 +67,8 @@ impl StreamRequest {
             app_protocol: None,
             dest_url: None,
             source_addr: Some(peer_addr),
+            conn_source_addr: None,
+            real_source_addr: None,
             source_mac: None,
             source_hostname: None,
             source_online_secs: None,
@@ -212,6 +222,38 @@ impl MapCollection for StreamRequestMap {
                     return Err(msg);
                 }
             }
+            "conn_source_addr" => {
+                prev = request
+                    .conn_source_addr
+                    .map(|addr| CollectionValue::String(addr.to_string()));
+                if let CollectionValue::String(addr) = value {
+                    request.conn_source_addr = Some(addr.parse().map_err(|e| {
+                        let msg = format!("Failed to parse conn_source_addr: {}, {}", addr, e);
+                        error!("{}", msg);
+                        msg
+                    })?);
+                } else {
+                    let msg = format!("conn_source_addr must be a string, got {:?}", value);
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
+            "real_source_addr" => {
+                prev = request
+                    .real_source_addr
+                    .map(|addr| CollectionValue::String(addr.to_string()));
+                if let CollectionValue::String(addr) = value {
+                    request.real_source_addr = Some(addr.parse().map_err(|e| {
+                        let msg = format!("Failed to parse real_source_addr: {}, {}", addr, e);
+                        error!("{}", msg);
+                        msg
+                    })?);
+                } else {
+                    let msg = format!("real_source_addr must be a string, got {:?}", value);
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
             "source_mac" => {
                 prev = request.source_mac.clone().map(CollectionValue::String);
                 if let CollectionValue::String(mac) = value {
@@ -339,6 +381,12 @@ impl MapCollection for StreamRequestMap {
             "source_addr" => Ok(request
                 .source_addr
                 .map(|addr| CollectionValue::String(addr.to_string()))),
+            "conn_source_addr" => Ok(request
+                .conn_source_addr
+                .map(|addr| CollectionValue::String(addr.to_string()))),
+            "real_source_addr" => Ok(request
+                .real_source_addr
+                .map(|addr| CollectionValue::String(addr.to_string()))),
             "source_mac" => Ok(request.source_mac.clone().map(CollectionValue::String)),
             "source_hostname" => Ok(request.source_hostname.clone().map(CollectionValue::String)),
             "source_online_secs" => Ok(request
@@ -377,6 +425,8 @@ impl MapCollection for StreamRequestMap {
             "app_protocol" => Ok(request.app_protocol.is_some()),
             "dest_url" => Ok(request.dest_url.is_some()),
             "source_addr" => Ok(request.source_addr.is_some()),
+            "conn_source_addr" => Ok(request.conn_source_addr.is_some()),
+            "real_source_addr" => Ok(request.real_source_addr.is_some()),
             "source_mac" => Ok(request.source_mac.is_some()),
             "source_hostname" => Ok(request.source_hostname.is_some()),
             "source_online_secs" => Ok(request.source_online_secs.is_some()),
@@ -415,6 +465,14 @@ impl MapCollection for StreamRequestMap {
             "dest_url" => Ok(request.dest_url.take().map(CollectionValue::String)),
             "source_addr" => Ok(request
                 .source_addr
+                .take()
+                .map(|addr| CollectionValue::String(addr.to_string()))),
+            "conn_source_addr" => Ok(request
+                .conn_source_addr
+                .take()
+                .map(|addr| CollectionValue::String(addr.to_string()))),
+            "real_source_addr" => Ok(request
+                .real_source_addr
                 .take()
                 .map(|addr| CollectionValue::String(addr.to_string()))),
             "source_mac" => Ok(request.source_mac.take().map(CollectionValue::String)),
@@ -462,6 +520,20 @@ impl MapCollection for StreamRequestMap {
                 "source_addr",
                 request
                     .source_addr
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "conn_source_addr",
+                request
+                    .conn_source_addr
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "real_source_addr",
+                request
+                    .real_source_addr
                     .map(|addr| addr.to_string())
                     .unwrap_or_default(),
             ),
@@ -530,6 +602,18 @@ impl MapCollection for StreamRequestMap {
         if let Some(addr) = &request.source_addr {
             result.push((
                 "source_addr".to_string(),
+                CollectionValue::String(addr.to_string()),
+            ));
+        }
+        if let Some(addr) = &request.conn_source_addr {
+            result.push((
+                "conn_source_addr".to_string(),
+                CollectionValue::String(addr.to_string()),
+            ));
+        }
+        if let Some(addr) = &request.real_source_addr {
+            result.push((
+                "real_source_addr".to_string(),
                 CollectionValue::String(addr.to_string()),
             ));
         }

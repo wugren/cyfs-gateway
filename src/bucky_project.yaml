@@ -5,9 +5,15 @@ modules:
   cyfs_gateway:
     type: rust
     name: cyfs_gateway
+  web3_gateway:
+    type: rust
+    name: web3_gateway
   test_server:
     type: rust
     name: test_server
+  bns_dv:
+    type: rust
+    name: bns-server
 apps:
   cyfs-gateway:
     name: cyfs-gateway
@@ -23,8 +29,10 @@ apps:
     rootfs: web3-gateway/
     default_target_rootfs: ${APPDATA}/web3-gateway/
     modules:
-      cyfs_gateway: web3_gateway
+      web3_gateway: web3_gateway
+      bns_dv: bns_dv
       web3_gateway_config: web3_gateway.yaml
+      init_anvil.py: init_anvil.py
       start.py: start.py
       stop.py: stop.py
     data_paths:

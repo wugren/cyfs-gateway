@@ -444,14 +444,25 @@ Examples:
         hash
     }
 
+    // Source IP lookup order: trusted restored source first, then the
+    // effective source, then the HTTP compat scalar. Keeps one `forward
+    // ip_hash` config working across HTTP and non-HTTP process chains.
     async fn extract_source_ip(context: &Context) -> Option<IpAddr> {
         if let Ok(Some(req)) = context.env().get("REQ", None).await {
             if let Some(req) = req.into_map() {
-                if let Ok(Some(value)) = req.get("source_ip").await {
-                    if let Some(ip) = value.as_str().and_then(|v| v.parse::<IpAddr>().ok()) {
-                        return Some(ip);
+                for key in ["real_source_ip", "source_ip"] {
+                    if let Ok(Some(value)) = req.get(key).await {
+                        if let Some(ip) = value.as_str().and_then(|v| v.parse::<IpAddr>().ok()) {
+                            return Some(ip);
+                        }
                     }
                 }
+            }
+        }
+
+        if let Ok(Some(value)) = context.env().get("REQ_remote_ip", None).await {
+            if let Some(ip) = value.as_str().and_then(|v| v.parse::<IpAddr>().ok()) {
+                return Some(ip);
             }
         }
 
@@ -955,7 +966,112 @@ impl ExternalCommand for Forward {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cyfs_process_chain::{CollectionValue, CommandArg, CommandArgs, MemoryMapCollection};
+    use crate::global_process_chains::{create_process_chain_executor, execute_stream_chain};
+    use crate::{ProcessChainConfigs, ServerManager, get_external_commands};
+    use cyfs_process_chain::{
+        CollectionValue, CommandArg, CommandArgs, CommandControl, MemoryMapCollection,
+        StreamRequest,
+    };
+    use std::sync::{Arc, Mutex};
+
+    /// Run a stream chain with `forward ip_hash` over two weight-1 upstreams
+    /// and return the selected URL (None when selection failed).
+    ///
+    /// nginx_ip_hash picks the FIRST upstream for 203.0.113.9 and the SECOND
+    /// for 10.0.0.1, so the selected URL reveals which source IP was used.
+    async fn run_ip_hash_chain(
+        mut request: StreamRequest,
+        remote_ip_env: Option<&str>,
+    ) -> Option<String> {
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        forward ip_hash "tcp:///10.0.0.1:1000,weight=1" "tcp:///10.0.0.2:1000,weight=1";
+"#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+        let servers = Arc::new(ServerManager::new());
+        let (executor, _hook_env) = create_process_chain_executor(
+            &chains,
+            None,
+            None,
+            Some(get_external_commands(Arc::downgrade(&servers))),
+            None,
+        )
+        .await
+        .unwrap();
+        if let Some(ip) = remote_ip_env {
+            executor
+                .global_env()
+                .create("REQ_remote_ip", CollectionValue::String(ip.to_string()))
+                .await
+                .unwrap();
+        }
+        let (client, _server) = tokio::io::duplex(16);
+        request.incoming_stream = Arc::new(Mutex::new(Some(Box::new(client))));
+
+        let ret = match execute_stream_chain(executor, request).await {
+            Ok((ret, _stream)) => ret,
+            Err(_) => return None,
+        };
+        if let Some(CommandControl::Return(ret)) = ret.as_control() {
+            if let CollectionValue::String(value) = &ret.value {
+                let list = shlex::split(value.as_str())?;
+                if list.len() == 2 && list[0] == "forward" {
+                    return Some(list[1].clone());
+                }
+            }
+        }
+        None
+    }
+
+    const FIRST_UPSTREAM: &str = "tcp:///10.0.0.1:1000";
+    const SECOND_UPSTREAM: &str = "tcp:///10.0.0.2:1000";
+
+    #[tokio::test]
+    async fn test_ip_hash_prefers_real_source_ip() {
+        // real_source_ip (203.0.113.9 -> first) must win over
+        // source_ip (10.0.0.1 -> second).
+        let mut request = StreamRequest::default();
+        request.source_addr = Some("10.0.0.1:80".parse().unwrap());
+        request.real_source_addr = Some("203.0.113.9:70".parse().unwrap());
+        let selected = run_ip_hash_chain(request, None).await;
+        assert_eq!(selected.as_deref(), Some(FIRST_UPSTREAM));
+    }
+
+    #[tokio::test]
+    async fn test_ip_hash_uses_source_ip_without_real_source() {
+        let mut request = StreamRequest::default();
+        request.source_addr = Some("10.0.0.1:80".parse().unwrap());
+        let selected = run_ip_hash_chain(request, None).await;
+        assert_eq!(selected.as_deref(), Some(SECOND_UPSTREAM));
+    }
+
+    #[tokio::test]
+    async fn test_ip_hash_falls_back_to_req_remote_ip() {
+        // No REQ source fields at all (HTTP-style env): the scalar
+        // REQ_remote_ip compat variable must be used.
+        let request = StreamRequest::default();
+        let selected = run_ip_hash_chain(request, Some("203.0.113.9")).await;
+        assert_eq!(selected.as_deref(), Some(FIRST_UPSTREAM));
+    }
+
+    #[tokio::test]
+    async fn test_ip_hash_prefers_req_source_ip_over_remote_ip_env() {
+        let mut request = StreamRequest::default();
+        request.source_addr = Some("10.0.0.1:80".parse().unwrap());
+        let selected = run_ip_hash_chain(request, Some("203.0.113.9")).await;
+        assert_eq!(selected.as_deref(), Some(SECOND_UPSTREAM));
+    }
+
+    #[tokio::test]
+    async fn test_ip_hash_without_any_source_fails() {
+        let request = StreamRequest::default();
+        let selected = run_ip_hash_chain(request, None).await;
+        assert_eq!(selected, None);
+    }
 
     #[tokio::test]
     async fn test_parse_upstream_map_supports_string_and_number_weights() {

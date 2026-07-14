@@ -108,6 +108,7 @@ impl TunConnectionHandler {
         };
         let mut request = StreamRequest::new(req_stream, dest_addr);
         request.source_addr = Some(remote_addr);
+        request.conn_source_addr = Some(remote_addr);
         request.dest_port = dest_addr.port();
         request.app_protocol = Some("tcp".to_string());
         let chain_env = executor.chain_env().clone();
@@ -308,6 +309,7 @@ impl TunConnectionHandler {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        insert_req_source_addr_group(&map, "conn_source_", remote_addr).await?;
         map.insert(
             "dest_ip",
             CollectionValue::String(dest_addr.ip().to_string()),

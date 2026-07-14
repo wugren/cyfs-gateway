@@ -35,6 +35,9 @@ limiters:
     concurrent: 2048
 
 stacks:
+  __control_server__:
+    bind: 127.0.0.1:{{control_server_port}}
+
   test1:
     bind: 127.0.0.1:{{test1_port}}
     protocol: tcp

@@ -316,6 +316,8 @@ impl TlsConnectionHandler {
             };
         let mut request = StreamRequest::new(request_stream, local_addr);
         request.source_addr = Some(request_source_addr);
+        request.conn_source_addr = Some(remote_addr);
+        request.real_source_addr = proxy_source_addr;
         request.dest_port = local_addr.port();
         request.dest_host = server_name;
         if let Some(device_info) = self
@@ -831,11 +833,12 @@ impl Stack for TlsStack {
             .iter()
             .map(|s| s.as_bytes().to_vec())
             .collect();
+        let cert_list = build_tls_domain_configs(config).await?;
 
         let new_handler = TlsConnectionHandler::create(
             config.hook_point.clone(),
-            vec![],
-            build_identity_cert_config(&config.hosts, config.identity_manager.as_ref())?,
+            cert_list,
+            build_tls_identity_cert_config(&config.hosts, config.identity_manager.as_ref())?,
             alpn_protocols,
             env,
             self.connection_manager.clone(),
@@ -910,6 +913,32 @@ pub struct TlsIdentityManagerConfig {
     pub security_root_path: Option<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum TlsHostConfig {
+    Host(String),
+    Cert(TlsHostCertConfig),
+}
+
+impl TlsHostConfig {
+    fn identity_host(&self) -> Option<&str> {
+        match self {
+            Self::Host(host) => Some(host.as_str()),
+            Self::Cert(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub struct TlsHostCertConfig {
+    #[serde(alias = "domain")]
+    pub host: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cert_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub key_path: Option<String>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct TlsStackConfig {
     pub id: String,
@@ -917,7 +946,7 @@ pub struct TlsStackConfig {
     pub bind: std::net::SocketAddr,
     pub hook_point: Vec<crate::ProcessChainConfig>,
     #[serde(default)]
-    pub hosts: Vec<String>,
+    pub hosts: Vec<TlsHostConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity_manager: Option<TlsIdentityManagerConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -939,6 +968,46 @@ pub struct TlsStackConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connect_timeout: Option<u64>,
     pub reuse_address: Option<bool>,
+}
+
+async fn build_tls_domain_configs(config: &TlsStackConfig) -> StackResult<Vec<TlsDomainConfig>> {
+    let mut cert_list = Vec::new();
+    for host_config in config.hosts.iter() {
+        let TlsHostConfig::Cert(host_config) = host_config else {
+            continue;
+        };
+        match (
+            host_config.cert_path.as_deref(),
+            host_config.key_path.as_deref(),
+        ) {
+            (Some(cert_path), Some(key_path)) => {
+                if !std::path::Path::new(cert_path).is_absolute()
+                    || !std::path::Path::new(key_path).is_absolute()
+                {
+                    return Err(stack_err!(
+                        StackErrorCode::InvalidConfig,
+                        "cert_path and key_path must be absolute paths for {}",
+                        host_config.host
+                    ));
+                }
+                let certs = load_certs(cert_path).await?;
+                let key = load_key(key_path).await?;
+                cert_list.push(TlsDomainConfig {
+                    domain: host_config.host.clone(),
+                    certs: Some(certs),
+                    key: Some(key),
+                });
+            }
+            _ => {
+                return Err(stack_err!(
+                    StackErrorCode::InvalidConfig,
+                    "cert_path and key_path must both be configured for {}",
+                    host_config.host
+                ));
+            }
+        }
+    }
+    Ok(cert_list)
 }
 
 impl crate::StackConfig for TlsStackConfig {
@@ -1011,6 +1080,17 @@ pub(crate) fn build_identity_cert_config(
     }))
 }
 
+fn build_tls_identity_cert_config(
+    hosts: &[TlsHostConfig],
+    identity_manager: Option<&TlsIdentityManagerConfig>,
+) -> StackResult<Option<TlsIdentityCertConfig>> {
+    let hosts = hosts
+        .iter()
+        .filter_map(|host| host.identity_host().map(ToOwned::to_owned))
+        .collect::<Vec<_>>();
+    build_identity_cert_config(&hosts, identity_manager)
+}
+
 pub struct TlsStackFactory {
     connection_manager: ConnectionManagerRef,
     server_runtime: ServerRuntime,
@@ -1040,8 +1120,9 @@ impl crate::StackFactory for TlsStackFactory {
                 "invalid tls stack config"
             ))?;
 
+        let cert_list = build_tls_domain_configs(config).await?;
         let identity_certs =
-            build_identity_cert_config(&config.hosts, config.identity_manager.as_ref())?;
+            build_tls_identity_cert_config(&config.hosts, config.identity_manager.as_ref())?;
 
         let stack_context = context
             .as_ref()
@@ -1069,6 +1150,7 @@ impl crate::StackFactory for TlsStackFactory {
             .server_runtime(self.server_runtime.clone())
             .connection_manager(self.connection_manager.clone())
             .hook_point(config.hook_point.clone())
+            .add_certs(cert_list)
             .identity_certs(identity_certs)
             .concurrency(config.concurrency.unwrap_or(DEFAULT_TLS_CONCURRENCY))
             .alpn_protocols(
@@ -1208,8 +1290,8 @@ impl TlsStackBuilder {
 #[cfg_attr(coverage_nightly, coverage(off))]
 mod tests {
     use super::{
-        TlsConnectionHandler, TlsIdentityManagerConfig, build_identity_cert_config, load_certs,
-        load_key,
+        TlsConnectionHandler, TlsHostConfig, TlsIdentityManagerConfig, build_identity_cert_config,
+        build_tls_domain_configs, build_tls_identity_cert_config, load_certs, load_key,
     };
     use crate::global_process_chains::GlobalProcessChains;
     use crate::self_cert_mgr::{SelfCertConfig, SelfCertMgr, SelfCertMgrRef};
@@ -2167,7 +2249,8 @@ mod tests {
 
         let (signing_key, _pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let _device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
+        let _device_config =
+            DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
 
         let config =
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -2279,7 +2362,8 @@ mod tests {
 
         let (signing_key, _pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let _device_config = DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
+        let _device_config =
+            DeviceConfig::new_by_jwk("test", serde_json::from_value(jwk).unwrap());
 
         let config =
             ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
@@ -2775,7 +2859,13 @@ hook_point: []
         )
         .unwrap();
 
-        assert_eq!(config.hosts, vec!["example.com", "*.example.org"]);
+        assert_eq!(
+            config.hosts,
+            vec![
+                TlsHostConfig::Host("example.com".to_string()),
+                TlsHostConfig::Host("*.example.org".to_string())
+            ]
+        );
         let identity_manager = config.identity_manager.unwrap();
         assert_eq!(
             identity_manager.public_root_path.as_deref(),
@@ -2785,6 +2875,88 @@ hook_point: []
             identity_manager.security_root_path.as_deref(),
             Some("/tmp/security")
         );
+    }
+
+    #[tokio::test]
+    async fn test_tls_stack_config_loads_cert_paths() {
+        let cert_key = generate_simple_self_signed(vec!["cert.example.com".to_string()]).unwrap();
+        let tmp_dir = tempdir().unwrap();
+        let cert_path = tmp_dir.path().join("fullchain.pem");
+        let key_path = tmp_dir.path().join("leaf.key");
+        fs::write(&cert_path, cert_key.cert.pem()).await.unwrap();
+        fs::write(&key_path, cert_key.signing_key.serialize_pem())
+            .await
+            .unwrap();
+
+        let config: TlsStackConfig = serde_yaml_ng::from_str(&format!(
+            r#"
+id: tls_test
+protocol: tls
+bind: 127.0.0.1:443
+hosts:
+  - example.com
+  - host: cert.example.com
+    cert_path: {}
+    key_path: {}
+hook_point: []
+"#,
+            cert_path.display(),
+            key_path.display(),
+        ))
+        .unwrap();
+
+        let identity_certs = build_tls_identity_cert_config(&config.hosts, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity_certs.hosts.len(), 1);
+        assert_eq!(identity_certs.hosts[0].identity, "example.com");
+
+        let certs = build_tls_domain_configs(&config).await.unwrap();
+        assert_eq!(certs.len(), 1);
+        assert_eq!(certs[0].domain, "cert.example.com");
+        assert!(certs.iter().all(|item| item.certs.is_some()));
+        assert!(certs.iter().all(|item| item.key.is_some()));
+    }
+
+    #[tokio::test]
+    async fn test_tls_stack_config_rejects_relative_cert_paths() {
+        let config: TlsStackConfig = serde_yaml_ng::from_str(
+            r#"
+id: tls_test
+protocol: tls
+bind: 127.0.0.1:443
+hosts:
+  - host: cert.example.com
+    cert_path: ./fullchain.pem
+    key_path: ./leaf.key
+hook_point: []
+"#,
+        )
+        .unwrap();
+
+        let result = build_tls_domain_configs(&config).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_tls_stack_config_rejects_host_object_without_cert_paths() {
+        let config: TlsStackConfig = serde_yaml_ng::from_str(
+            r#"
+id: tls_test
+protocol: tls
+bind: 127.0.0.1:443
+hosts:
+  - host: cert.example.com
+hook_point: []
+"#,
+        )
+        .unwrap();
+
+        let identity_certs = build_tls_identity_cert_config(&config.hosts, None).unwrap();
+        assert!(identity_certs.is_none());
+
+        let result = build_tls_domain_configs(&config).await;
+        assert!(result.is_err());
     }
 
     #[test]

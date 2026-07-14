@@ -68,6 +68,29 @@ pub fn connect_timeout_from_secs(timeout_secs: Option<u64>) -> Duration {
     Duration::from_secs(timeout_secs.unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS))
 }
 
+/// Insert a `<prefix>addr` / `<prefix>ip` / `<prefix>port` group into a REQ
+/// map collection. `prefix` is a source-layer prefix such as `source_`,
+/// `conn_source_` or `real_source_`.
+pub async fn insert_req_source_addr_group(
+    map: &cyfs_process_chain::MapCollectionRef,
+    prefix: &str,
+    addr: std::net::SocketAddr,
+) -> StackResult<()> {
+    for (suffix, value) in [
+        ("addr", addr.to_string()),
+        ("ip", addr.ip().to_string()),
+        ("port", addr.port().to_string()),
+    ] {
+        map.insert(
+            format!("{}{}", prefix, suffix).as_str(),
+            CollectionValue::String(value),
+        )
+        .await
+        .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+    }
+    Ok(())
+}
+
 pub async fn get_source_addr_from_req_env(
     global_env: &cyfs_process_chain::EnvRef,
 ) -> Option<String> {

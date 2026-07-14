@@ -1,0 +1,403 @@
+{
+  "schema": 1,
+  "version": "v0.6",
+  "requested_module": "all",
+  "requested_level": "all",
+  "started_at": "2026-07-14T12:03:13+00:00",
+  "finished_at": "2026-07-14T12:17:06+00:00",
+  "git_head": "1d4524c8e7cf277838ba52ad8ca682099c8f1602",
+  "worktree_dirty": true,
+  "steps": [
+    {
+      "module": "cert-manager",
+      "level": "unit",
+      "id": "cert-manager-unit-prepare-reload",
+      "name": "\u6267\u884c tunnel client cert snapshot \u805a\u7126\u5355\u6d4b",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-gateway-lib test_prepare_reload --lib -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [],
+      "exit_code": 0,
+      "duration_s": 22.511
+    },
+    {
+      "module": "cert-manager",
+      "level": "unit",
+      "id": "cert-manager-unit-validate-acme-entry",
+      "name": "\u6267\u884c tunnel client ACME \u6761\u76ee\u6821\u9a8c\u5355\u6d4b",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-gateway-lib test_validate_acme_entry_rules --lib -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [],
+      "exit_code": 0,
+      "duration_s": 12.74
+    },
+    {
+      "module": "cert-manager",
+      "level": "unit",
+      "id": "cert-manager-unit-mismatched-key",
+      "name": "\u6267\u884c\u672c\u5730\u8bc1\u4e66\u4e0e\u79c1\u94a5\u4e0d\u5339\u914d\u5355\u6d4b",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-gateway-lib test_load_local_material_rejects_mismatched_key --lib -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [],
+      "exit_code": 0,
+      "duration_s": 12.891
+    },
+    {
+      "module": "cert-manager",
+      "level": "unit",
+      "id": "cert-manager-unit-wildcard",
+      "name": "\u6267\u884c SNI wildcard \u89e3\u6790\u5355\u6d4b",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-gateway-lib test_matches_wildcard --lib -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [],
+      "exit_code": 0,
+      "duration_s": 12.389
+    },
+    {
+      "module": "cert-manager",
+      "level": "unit",
+      "id": "cert-manager-unit-default-acme-provider",
+      "name": "\u6267\u884c TLS \u65e7\u683c\u5f0f\u9ed8\u8ba4 ACME provider \u517c\u5bb9\u5355\u6d4b",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-gateway-lib test_tls_acme_type_without_cert_provider_uses_default_provider --lib -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [],
+      "exit_code": 0,
+      "duration_s": 12.34
+    },
+    {
+      "module": "cert-manager",
+      "level": "unit",
+      "id": "cert-manager-unit-js_extend_cert_provider",
+      "name": "\u6267\u884c js_extend_cert_provider \u805a\u7126\u5355\u6d4b",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-acme js_extend_cert_provider --lib -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [],
+      "exit_code": 0,
+      "duration_s": 37.092
+    },
+    {
+      "module": "cert-manager",
+      "level": "unit",
+      "id": "cert-manager-unit-parse-js_extend_cert_provider",
+      "name": "\u6267\u884c js_extend_cert_provider \u914d\u7f6e\u89e3\u6790\u4e0e params_path \u88c5\u8f7d\u5355\u6d4b",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs_gateway js_extend_cert_provider_config --lib -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [],
+      "exit_code": 0,
+      "duration_s": 46.714
+    },
+    {
+      "module": "cert-manager",
+      "level": "dv",
+      "id": "cert-manager-dv-tls-self-cert",
+      "name": "\u6267\u884c TLS \u81ea\u7b7e fallback DV \u6d4b\u8bd5",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-gateway-lib test_tls_stack_self_cert --lib -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [],
+      "exit_code": 0,
+      "duration_s": 25.567
+    },
+    {
+      "module": "cert-manager",
+      "level": "dv",
+      "id": "cert-manager-dv-quic-self-cert",
+      "name": "\u6267\u884c QUIC \u81ea\u7b7e fallback DV \u6d4b\u8bd5",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-gateway-lib test_quic_stack_self_cert --lib -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [],
+      "exit_code": 0,
+      "duration_s": 13.642
+    },
+    {
+      "module": "cert-manager",
+      "level": "dv",
+      "id": "cert-manager-dv-tls-client-auth",
+      "name": "\u6267\u884c TLS client auth \u8bc1\u4e66\u7b56\u7565 DV \u6d4b\u8bd5",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-gateway-lib test_tls_stack_client_auth_on_requires_valid_cert --lib -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [],
+      "exit_code": 0,
+      "duration_s": 13.141
+    },
+    {
+      "module": "cert-manager",
+      "level": "dv",
+      "id": "cert-manager-dv-control-server",
+      "name": "\u6267\u884c gateway \u8bc1\u4e66 wiring smoke",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs_gateway --test test_control_server test_cmd_server -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [],
+      "exit_code": 0,
+      "duration_s": 30.326
+    },
+    {
+      "module": "cert-manager",
+      "level": "integration",
+      "id": "cert-manager-integration-mtls-policy",
+      "name": "\u6267\u884c tunnel client cert policy \u96c6\u6210\u6d4b\u8bd5",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs_gateway --test test_cyfs_gateway test_socks5_to_tls_stack_with_client_cert_policy -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [],
+      "exit_code": 0,
+      "duration_s": 14.295
+    },
+    {
+      "module": "cyfs-tun",
+      "level": "unit",
+      "id": "cyfs-tun-unit",
+      "name": "\u6267\u884c 'tuntunnel' crate \u5355\u6d4b smoke",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-tun test_tuntunnel_ -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1200,
+      "change_ids": [],
+      "exit_code": 0,
+      "duration_s": 12.89
+    },
+    {
+      "module": "gateway-runtime",
+      "level": "unit",
+      "id": "gateway-runtime-unit",
+      "name": "\u6267\u884c\u805a\u7126\u8fd0\u884c\u65f6\u5355\u6d4b smoke",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-gateway-lib test_connection_manager_add_and_get_connection -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [
+        "P-base-1"
+      ],
+      "exit_code": 0,
+      "duration_s": 12.389
+    },
+    {
+      "module": "gateway-runtime",
+      "level": "unit",
+      "id": "gateway-runtime-control-port-config",
+      "name": "\u6267\u884c control_port \u914d\u7f6e\u5355\u6d4b",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs_gateway test_apply_control_port_config -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [
+        "P-control-server-port-config-1"
+      ],
+      "exit_code": 0,
+      "duration_s": 31.585
+    },
+    {
+      "module": "gateway-runtime",
+      "level": "unit",
+      "id": "gateway-runtime-tcp-stack",
+      "name": "\u6267\u884c TCP stack reuseport \u805a\u7126\u5355\u6d4b",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-gateway-lib test_tcp_stack -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [
+        "P-tcp-reuseport-1"
+      ],
+      "exit_code": 0,
+      "duration_s": 43.98
+    },
+    {
+      "module": "gateway-runtime",
+      "level": "unit",
+      "id": "gateway-runtime-tls-stack",
+      "name": "\u6267\u884c TLS stack reuseport \u805a\u7126\u5355\u6d4b",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-gateway-lib test_tls_stack -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [
+        "P-tls-reuseport-1"
+      ],
+      "exit_code": 0,
+      "duration_s": 49.128
+    },
+    {
+      "module": "gateway-runtime",
+      "level": "unit",
+      "id": "gateway-runtime-udp-stack",
+      "name": "\u6267\u884c UDP stack reuseport \u805a\u7126\u5355\u6d4b",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-gateway-lib test_udp_stack -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [
+        "P-udp-reuseport-1"
+      ],
+      "exit_code": 0,
+      "duration_s": 84.871
+    },
+    {
+      "module": "gateway-runtime",
+      "level": "unit",
+      "id": "gateway-runtime-dir-server-range",
+      "name": "\u6267\u884c DirServer Range \u56de\u5f52\u5355\u6d4b",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-gateway-lib test_dir_server_range_parses_supported_forms_and_rejects_invalid_ranges -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [
+        "P-dir-server-range-1"
+      ],
+      "exit_code": 0,
+      "duration_s": 15.099
+    },
+    {
+      "module": "gateway-runtime",
+      "level": "unit",
+      "id": "gateway-runtime-quic-stack",
+      "name": "\u6267\u884c QUIC stack reuseport \u805a\u7126\u5355\u6d4b",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs-gateway-lib test_quic_stack -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [
+        "P-quic-reuseport-1"
+      ],
+      "exit_code": 0,
+      "duration_s": 38.879
+    },
+    {
+      "module": "gateway-runtime",
+      "level": "dv",
+      "id": "gateway-runtime-dv",
+      "name": "\u6267\u884c\u63a7\u5236\u5e73\u9762 DV \u6d4b\u8bd5",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs_gateway --test test_control_server -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [
+        "P-base-1"
+      ],
+      "exit_code": 0,
+      "duration_s": 17.055
+    },
+    {
+      "module": "gateway-runtime",
+      "level": "integration",
+      "id": "gateway-runtime-integration",
+      "name": "\u6267\u884c\u5b8c\u6574\u7f51\u5173\u96c6\u6210\u6d4b\u8bd5",
+      "command": [
+        "bash",
+        "-lc",
+        "cd src && cargo test -p cyfs_gateway --test test_cyfs_gateway -- --test-threads=1"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [
+        "P-base-1",
+        "P-control-server-port-config-1"
+      ],
+      "exit_code": 0,
+      "duration_s": 20.357
+    },
+    {
+      "module": "gateway-runtime",
+      "level": "integration",
+      "id": "gateway-runtime-app-process-integration",
+      "name": "\u6267\u884c cyfs_gateway app \u8fdb\u7a0b\u7ea7 Python \u96c6\u6210\u6d4b\u8bd5",
+      "command": [
+        "bash",
+        "-lc",
+        "python3 tests/integration/cyfs_gateway_app/run.py"
+      ],
+      "workdir": "/mnt/f/work/gateway-dev",
+      "timeout_sec": 1800,
+      "change_ids": [
+        "P-base-1",
+        "P-control-server-port-config-1"
+      ],
+      "exit_code": 1,
+      "duration_s": 180.765
+    }
+  ],
+  "exit_code": 1
+}

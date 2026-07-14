@@ -1,0 +1,26 @@
+[package]
+name = "bns-server"
+version.workspace = true
+edition = "2021"
+authors = ["BuckyOS DAO", "@waterflier", "@lurenpluto", "@wugren"]
+
+[dependencies]
+async-trait.workspace = true
+bns-client = { path = "../bns-client" }
+bns-evm = { path = "../bns-evm" }
+bns-indexer = { path = "../bns-indexer" }
+bytes.workspace = true
+cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
+http.workspace = true
+http-body-util.workspace = true
+kRPC.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+name-client.workspace = true
+name-lib.workspace = true
+tempfile.workspace = true

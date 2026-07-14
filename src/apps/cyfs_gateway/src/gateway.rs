@@ -8,11 +8,6 @@ use std::time::Instant;
 
 use crate::acme_sn_provider::AcmeSnProviderFactory;
 use crate::config_loader::GatewayConfigParserRef;
-use crate::gateway_control_server::{
-    GatewayControlServerConfigParser, GatewayControlServerContext, GATEWAY_CONTROL_SERVER_CONFIG,
-    GATEWAY_CONTROL_SERVER_KEY,
-};
-use crate::socks::SocksTunnelBuilder;
 use crate::{merge, AcmeConfig, AcmeHostConfig, TlsCA};
 use anyhow::{anyhow, Result};
 use buckyos_kit::*;
@@ -21,8 +16,16 @@ use cyfs_acme::{AcmeCertManager, AcmeCertManagerRef, AcmeItem, CertManagerConfig
 use cyfs_dns::{
     DnsServerContext, InnerDnsRecordManager, InnerDnsRecordManagerRef, LocalDnsServerContext,
 };
+use cyfs_gateway_app_lib::{
+    GatewayControlServerConfigParser, GatewayControlServerContext, GATEWAY_CONTROL_SERVER_CONFIG,
+    GATEWAY_CONTROL_SERVER_KEY,
+};
 use cyfs_process_chain::CollectionValue;
-use cyfs_socks::SocksServerContext;
+use cyfs_socks::{SocksServerContext, SocksTunnelBuilder};
+use cyfs_traffic::{
+    TrafficQuotaService, TrafficServiceHandle, TrafficStatFactory, TrafficStatFactoryRef,
+    TrafficUserLimiterFactory,
+};
 use cyfs_tun::TunStackContext;
 use jsonwebtoken::jwk::Jwk;
 use jsonwebtoken::{DecodingKey, EncodingKey};
@@ -38,6 +41,7 @@ use serde_json::{json, Map, Value};
 use sfo_js::object::builtins::JsArray;
 use sfo_js::{JsEngine, JsPkg, JsPkgManager, JsPkgManagerRef, JsString, JsValue, NativeFunction};
 use sha2::Digest;
+use std::future::Future;
 use tokio::fs::create_dir_all;
 use url::Url;
 
@@ -828,7 +832,8 @@ impl GatewayFactory {
         };
 
         let mut limiter_manager = DefaultLimiterManager::new();
-        let stat_manager = StatManager::new();
+        let traffic_stat_factory = TrafficStatFactory::new(config.traffic.stat_prefix.clone());
+        let stat_manager = StatManager::with_stat_factory(traffic_stat_factory.clone());
         if let Some(limiters_config) = config.limiters_config.clone() {
             for limiter_config in limiters_config.iter() {
                 if limiter_manager
@@ -859,8 +864,15 @@ impl GatewayFactory {
                 );
             }
         }
-        let limiter_manager: Arc<Box<dyn LimiterManager>> = Arc::new(limiter_manager);
-
+        if config.traffic.enabled {
+            limiter_manager.set_limiter_factory(Some(Arc::new(
+                TrafficUserLimiterFactory::new_http(
+                    config.traffic.clone(),
+                    traffic_stat_factory.clone(),
+                )?,
+            )));
+        }
+        let limiter_manager: LimiterManagerRef = Arc::new(limiter_manager);
         let sn_acme_data = get_buckyos_service_data_dir("cyfs_gateway").join("sn_dns");
         if !sn_acme_data.exists() {
             std::fs::create_dir_all(&sn_acme_data).unwrap();
@@ -979,6 +991,17 @@ impl GatewayFactory {
 
         let control_handler: Arc<dyn GatewayControlCmdHandler> = handler.clone();
         let timer_manager = TimerManager::new();
+        let traffic_service = if config.traffic.enabled {
+            TrafficQuotaService::start_http(
+                config.traffic.clone(),
+                stat_manager.clone(),
+                traffic_stat_factory.clone(),
+                limiter_manager.clone(),
+            )
+            .await?
+        } else {
+            None
+        };
         let gateway = Arc::new(Gateway {
             config_file: config_file.map(|v| v.to_path_buf()),
             init_config: Mutex::new(init_config),
@@ -991,11 +1014,13 @@ impl GatewayFactory {
             server_factory: self.server_factory.clone(),
             limiter_manager: Mutex::new(limiter_manager),
             stat_manager,
+            traffic_stat_factory,
             external_cmds,
             control_handler,
             control_token_manager: token_manager,
             timer_manager,
             global_collection_manager: RwLock::new(global_collections.clone()),
+            traffic_service: Mutex::new(traffic_service),
         });
         let timers = gateway
             .config
@@ -1036,16 +1061,21 @@ pub struct Gateway {
     server_factory: CyfsServerFactoryRef,
     limiter_manager: Mutex<LimiterManagerRef>,
     stat_manager: StatManagerRef,
+    traffic_stat_factory: TrafficStatFactoryRef,
     external_cmds: JsPkgManagerRef,
     control_handler: Arc<dyn GatewayControlCmdHandler>,
     control_token_manager: Arc<LocalTokenManager<LocalTokenKeyStore>>,
     timer_manager: TimerManager,
     global_collection_manager: RwLock<GlobalCollectionManagerRef>,
+    traffic_service: Mutex<Option<TrafficServiceHandle>>,
 }
 
 impl Drop for Gateway {
     fn drop(&mut self) {
         self.timer_manager.stop_all();
+        if let Some(service) = self.traffic_service.lock().unwrap().take() {
+            service.shutdown_now();
+        }
         debug!("Gateway is dropped!");
     }
 }
@@ -2864,6 +2894,7 @@ impl Gateway {
     }
 
     pub async fn reload(&self, config: GatewayConfig) -> Result<()> {
+        let traffic_config = config.traffic.clone();
         let old_device_manager = { self.config.lock().unwrap().device_manager.clone() };
         if old_device_manager != config.device_manager {
             if config.device_manager.enabled {
@@ -2936,7 +2967,17 @@ impl Gateway {
             }
         }
         limiter_manager.retain(Box::new(move |id, _| exist_limters.contains(id)));
-        let limiter_manager = Arc::new(limiter_manager);
+        if traffic_config.enabled {
+            limiter_manager.set_limiter_factory(Some(Arc::new(
+                TrafficUserLimiterFactory::new_http(
+                    traffic_config.clone(),
+                    self.traffic_stat_factory.clone(),
+                )?,
+            )));
+        } else {
+            limiter_manager.set_limiter_factory(None);
+        }
+        let limiter_manager: LimiterManagerRef = Arc::new(limiter_manager);
 
         let cert_manager = build_acme_mgr_from_config(&config.acme_config).await?;
         let inner_dns_record_manager = InnerDnsRecordManager::new();
@@ -3105,8 +3146,37 @@ impl Gateway {
             .await?;
 
         *self.global_collection_manager.write().unwrap() = global_collections;
-        *self.config.lock().unwrap() = config;
+        let active_limiter_manager = limiter_manager.clone();
         *self.limiter_manager.lock().unwrap() = limiter_manager;
+        self.restart_traffic_service(traffic_config, active_limiter_manager)
+            .await?;
+        *self.config.lock().unwrap() = config;
+        Ok(())
+    }
+
+    async fn restart_traffic_service(
+        &self,
+        traffic_config: cyfs_traffic::TrafficConfig,
+        limiter_manager: LimiterManagerRef,
+    ) -> Result<()> {
+        let old_service = { self.traffic_service.lock().unwrap().take() };
+        if let Some(service) = old_service {
+            service.stop().await;
+        }
+
+        if !traffic_config.enabled {
+            *self.traffic_service.lock().unwrap() = None;
+            return Ok(());
+        }
+
+        let new_service = TrafficQuotaService::start_http(
+            traffic_config,
+            self.stat_manager.clone(),
+            self.traffic_stat_factory.clone(),
+            limiter_manager,
+        )
+        .await?;
+        *self.traffic_service.lock().unwrap() = new_service;
         Ok(())
     }
 }
@@ -3117,11 +3187,30 @@ struct StartTemplateParams {
     args: Option<Vec<String>>,
 }
 
+pub type GatewayExternalCmdHandlerRef = Arc<dyn GatewayExternalCmdHandler>;
+
+#[async_trait::async_trait]
+pub trait GatewayExternalCmdHandler: Send + Sync + 'static {
+    async fn handle(&self, gateway: Arc<Gateway>, params: Value) -> ControlResult<Value>;
+}
+
+#[async_trait::async_trait]
+impl<F, Fut> GatewayExternalCmdHandler for F
+where
+    F: Fn(Arc<Gateway>, Value) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ControlResult<Value>> + Send + 'static,
+{
+    async fn handle(&self, gateway: Arc<Gateway>, params: Value) -> ControlResult<Value> {
+        self(gateway, params).await
+    }
+}
+
 pub struct GatewayCmdHandler {
     gateway: Mutex<Option<Weak<Gateway>>>,
     config_file: Option<PathBuf>,
     parser: GatewayConfigParserRef,
     started_at: Instant,
+    external_cmd_handlers: RwLock<HashMap<String, GatewayExternalCmdHandlerRef>>,
 }
 
 impl GatewayCmdHandler {
@@ -3131,6 +3220,7 @@ impl GatewayCmdHandler {
             config_file,
             parser,
             started_at: Instant::now(),
+            external_cmd_handlers: RwLock::new(HashMap::new()),
         })
     }
 
@@ -3147,6 +3237,98 @@ impl GatewayCmdHandler {
         } else {
             None
         }
+    }
+
+    fn is_builtin_cmd(method: &str) -> bool {
+        matches!(
+            method,
+            "get_config"
+                | "get_init_config"
+                | "get_system_info"
+                | "collection_list"
+                | "collection_get"
+                | "collection_set_add"
+                | "collection_set_del"
+                | "collection_map_put"
+                | "collection_map_del"
+                | "save_config"
+                | "remove_rule"
+                | "get_connections"
+                | "get_connection_devices"
+                | "query_tunnel_url_statuses"
+                | "tunnels_probe"
+                | "/tunnels/probe"
+                | "add_name_provider"
+                | "add-name-provider"
+                | "add_rule"
+                | "add_dispatch"
+                | "remove_dispatch"
+                | "add_router"
+                | "remove_router"
+                | "append_rule"
+                | "insert_rule"
+                | "move_rule"
+                | "set_rule"
+                | "reload"
+                | "start"
+                | "external_cmds"
+                | "cmd_help"
+        )
+    }
+
+    pub fn register_external_cmd(
+        &self,
+        method: impl Into<String>,
+        handler: GatewayExternalCmdHandlerRef,
+    ) -> ControlResult<()> {
+        let method = method.into();
+        if method.trim().is_empty() {
+            return Err(cmd_err!(
+                ControlErrorCode::InvalidParams,
+                "external cmd method is empty"
+            ));
+        }
+        if Self::is_builtin_cmd(method.as_str()) {
+            return Err(cmd_err!(
+                ControlErrorCode::InvalidParams,
+                "external cmd conflicts with builtin method: {}",
+                method
+            ));
+        }
+
+        let mut handlers = self.external_cmd_handlers.write().unwrap();
+        if handlers.contains_key(method.as_str()) {
+            return Err(cmd_err!(
+                ControlErrorCode::InvalidParams,
+                "external cmd already registered: {}",
+                method
+            ));
+        }
+        handlers.insert(method, handler);
+        Ok(())
+    }
+
+    pub fn unregister_external_cmd(&self, method: &str) -> Option<GatewayExternalCmdHandlerRef> {
+        self.external_cmd_handlers.write().unwrap().remove(method)
+    }
+
+    async fn handle_registered_external_cmd(
+        &self,
+        gateway: Arc<Gateway>,
+        method: &str,
+        params: Value,
+    ) -> ControlResult<Option<Value>> {
+        let handler = {
+            self.external_cmd_handlers
+                .read()
+                .unwrap()
+                .get(method)
+                .cloned()
+        };
+        let Some(handler) = handler else {
+            return Ok(None);
+        };
+        Ok(Some(handler.handle(gateway, params).await?))
     }
 
     async fn start_template(&self, template_id: &str, args: Vec<String>) -> ControlResult<Value> {
@@ -4050,11 +4232,19 @@ impl GatewayControlCmdHandler for GatewayCmdHandler {
                 Ok(serde_json::to_value(help)
                     .map_err(into_cmd_err!(ControlErrorCode::SerializeFailed))?)
             }
-            v => Err(cmd_err!(
-                ControlErrorCode::InvalidMethod,
-                "Invalid method: {}",
-                v
-            )),
+            v => {
+                if let Some(result) = self
+                    .handle_registered_external_cmd(gateway.clone(), v, params)
+                    .await?
+                {
+                    return Ok(result);
+                }
+                Err(cmd_err!(
+                    ControlErrorCode::InvalidMethod,
+                    "Invalid method: {}",
+                    v
+                ))
+            }
         }
     }
 }
@@ -4271,6 +4461,7 @@ mod tests {
     use serde_json::json;
     use std::io::{Read, Write};
     use std::path::PathBuf;
+    use std::sync::Arc;
     use tempfile::TempDir;
 
     pub struct TempKeyStore {
@@ -4371,6 +4562,56 @@ mod tests {
         }
     }
 
+    fn test_external_cmd_handler() -> GatewayExternalCmdHandlerRef {
+        Arc::new(|_gateway: Arc<Gateway>, _params: Value| async move { Ok(Value::Null) })
+    }
+
+    #[test]
+    fn external_cmd_registry_rejects_builtin_method() {
+        let handler = GatewayCmdHandler::new(
+            None,
+            Arc::new(crate::config_loader::GatewayConfigParser::new()),
+        );
+
+        let err = handler
+            .register_external_cmd("reload", test_external_cmd_handler())
+            .unwrap_err();
+
+        assert_eq!(err.code(), ControlErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn external_cmd_registry_rejects_duplicate_method() {
+        let handler = GatewayCmdHandler::new(
+            None,
+            Arc::new(crate::config_loader::GatewayConfigParser::new()),
+        );
+
+        handler
+            .register_external_cmd("custom_status", test_external_cmd_handler())
+            .unwrap();
+        let err = handler
+            .register_external_cmd("custom_status", test_external_cmd_handler())
+            .unwrap_err();
+
+        assert_eq!(err.code(), ControlErrorCode::InvalidParams);
+    }
+
+    #[test]
+    fn external_cmd_registry_unregisters_method() {
+        let handler = GatewayCmdHandler::new(
+            None,
+            Arc::new(crate::config_loader::GatewayConfigParser::new()),
+        );
+
+        handler
+            .register_external_cmd("custom_status", test_external_cmd_handler())
+            .unwrap();
+
+        assert!(handler.unregister_external_cmd("custom_status").is_some());
+        assert!(handler.unregister_external_cmd("custom_status").is_none());
+    }
+
     #[tokio::test]
     async fn test_add_rule_to_existing_block_preserves_priority_and_prepends() {
         let raw_config = json!({
@@ -4446,6 +4687,7 @@ mod tests {
             .unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(1));
         let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(block_str, "new;");
 
         let updated =
             Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:main:default1", "new;")
@@ -4472,9 +4714,23 @@ mod tests {
 
         let updated =
             Gateway::add_rule_to_config(raw_config.clone(), "stack:s1:main", "new;").unwrap();
-        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].clone();
+        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]
+            .as_object()
+            .unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks
+            .values()
+            .any(|block| block["block"].as_str() == Some("new;")));
         let updated = Gateway::add_rule_to_config(raw_config.clone(), "stack:s1", "new;").unwrap();
-        let blocks = updated["stacks"]["s1"]["hook_point"].clone();
+        let chains = updated["stacks"]["s1"]["hook_point"].as_object().unwrap();
+        assert_eq!(chains.len(), 2);
+        assert!(chains.values().any(|chain| {
+            chain["blocks"].as_object().is_some_and(|blocks| {
+                blocks
+                    .values()
+                    .any(|block| block["block"].as_str() == Some("new;"))
+            })
+        }));
     }
 
     #[tokio::test]
@@ -4654,6 +4910,7 @@ mod tests {
             .unwrap();
         assert_eq!(block.get("priority").and_then(|v| v.as_i64()), Some(3));
         let block_str = block.get("block").and_then(|v| v.as_str()).unwrap();
+        assert_eq!(block_str, "new;");
 
         let updated =
             Gateway::append_rule_to_config(raw_config.clone(), "stack:s1:main:default1", "new;")
@@ -4680,10 +4937,24 @@ mod tests {
 
         let updated =
             Gateway::append_rule_to_config(raw_config.clone(), "stack:s1:main", "new;").unwrap();
-        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"].clone();
+        let blocks = updated["stacks"]["s1"]["hook_point"]["main"]["blocks"]
+            .as_object()
+            .unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks
+            .values()
+            .any(|block| block["block"].as_str() == Some("new;")));
         let updated =
             Gateway::append_rule_to_config(raw_config.clone(), "stack:s1", "new;").unwrap();
-        let blocks = updated["stacks"]["s1"]["hook_point"].clone();
+        let chains = updated["stacks"]["s1"]["hook_point"].as_object().unwrap();
+        assert_eq!(chains.len(), 2);
+        assert!(chains.values().any(|chain| {
+            chain["blocks"].as_object().is_some_and(|blocks| {
+                blocks
+                    .values()
+                    .any(|block| block["block"].as_str() == Some("new;"))
+            })
+        }));
     }
 
     #[tokio::test]
@@ -5314,13 +5585,11 @@ mod tests {
         println!("{}", rule);
         assert!(rule.starts_with(r#"match ${REQ.path} "/static/*" && rewrite ${REQ.path} "/static/*" "/*" && call-server"#));
         // dir server created
-        assert!(
-            updated["servers"]
-                .as_object()
-                .unwrap()
-                .keys()
-                .any(|k| k.starts_with("router_dir_"))
-        );
+        assert!(updated["servers"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .any(|k| k.starts_with("router_dir_")));
 
         let (updated, removed_id) =
             Gateway::remove_router_from_config(updated, Some("router_test"), "/static/*", "/www/")

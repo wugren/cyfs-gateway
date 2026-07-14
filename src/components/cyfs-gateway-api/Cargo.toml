@@ -8,6 +8,7 @@ authors = ["BuckyOS DAO", "@waterflier"]
 async-trait.workspace = true
 chrono.workspace = true
 hex.workspace = true
+jsonwebtoken.workspace = true
 kRPC.workspace = true
 log.workspace = true
 name-lib.workspace = true

@@ -12,6 +12,7 @@ tokio.workspace = true
 async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serde_yaml_ng.workspace = true
 env_logger.workspace = true
 url.workspace = true
 rand.workspace = true
@@ -24,18 +25,26 @@ http-body-util.workspace = true
 sha2.workspace = true
 hex.workspace = true
 ring.workspace = true
+sqlx.workspace = true
+reqwest.workspace = true
+base64.workspace = true
+# user_domain PKX proof 的外部 DoH 查询（RFC 8484 wire 编解码）；与 cyfs-dns 同版本。
+hickory-proto = "0.25.2"
 
 buckyos-kit.workspace = true
 kRPC.workspace = true
 name-client.workspace = true
 name-lib.workspace = true
+cyfs-gateway-api = { path = "../cyfs-gateway-api" }
 cyfs-gateway-lib = { path = "../cyfs-gateway-lib" }
+bns-client = { path = "../bns-client" }
+bns-evm = { path = "../bns-evm" }
 async-named-locker = "0.1"
 callback-trait = "0.1"
-sfo-sql = "0.4"
 sfo-result = "0.2"
+sfo-ip = "0.1"
 #buckyos-api = { path = "../../kernel/buckyos-api" }
 
 [dev-dependencies]
 tempfile = "3"
-reqwest.workspace = true
+bns-indexer = { path = "../bns-indexer" }

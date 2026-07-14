@@ -523,7 +523,9 @@ mod tests {
         let mut name_info = NameInfo::new("web3.buckyos.ai");
         name_info.ttl = Some(300);
 
-        let map = nameinfo_to_map_collection("HTTPS", &name_info).await.unwrap();
+        let map = nameinfo_to_map_collection("HTTPS", &name_info)
+            .await
+            .unwrap();
         let restored = map_collection_to_nameinfo(&map).await.unwrap();
 
         assert_eq!(restored.name, "web3.buckyos.ai");

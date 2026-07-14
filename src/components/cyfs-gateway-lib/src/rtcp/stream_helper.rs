@@ -128,7 +128,14 @@ impl RTcpStreamBuildHelper {
                 }
             }
 
-            let remaining_time = timeout_duration - start_time.elapsed();
+            let Some(remaining_time) = timeout_duration.checked_sub(start_time.elapsed()) else {
+                warn!(
+                    "Timeout: ropen stream {} was not found within the time limit.",
+                    key
+                );
+                self.wait_ropen_stream_map.lock().await.remove(key);
+                return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Timeout"));
+            };
             let check_interval = std::cmp::min(STREAM_WAIT_POLL_INTERVAL, remaining_time);
 
             if let Err(_) = timeout(check_interval, self.notify_ropen_stream.notified()).await {

@@ -1,0 +1,25 @@
+{
+  "nodes": {
+    "sn": {
+      "node_id": "sn",
+      "vm_template": "ubuntu_basic",
+      "network": {
+        "lan_id": "wlan",
+        "type": "bridge"
+      },
+      "apps": {
+        "web3-gateway": {
+          "node_group_name": "sn_server"
+        }
+      },
+      "init_commands": [
+        "sudo hostnamectl set-hostname sn_server",
+        "sudo chmod 777 /opt/"
+      ],
+      "directories": {
+        "logs": "/opt/buckyos/logs"
+      }
+    }
+  },
+  "instance_order": ["sn"]
+}

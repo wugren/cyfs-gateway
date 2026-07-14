@@ -69,12 +69,39 @@ pub(crate) struct RTcpTargetStackEP {
 
 impl RTcpTargetStackEP {
     pub fn new(target_did: DID, stack_port: u16) -> Result<Self> {
+        validate_rtcp_hostname_form_did(&target_did, "rtcp target did")
+            .map_err(anyhow::Error::msg)?;
         Ok(RTcpTargetStackEP {
             did: target_did,
             stack_port,
             bootstrap_stream_url: None,
         })
     }
+}
+
+pub(crate) fn validate_rtcp_hostname_form_did(
+    did: &DID,
+    context: &str,
+) -> std::result::Result<(), String> {
+    if did.get_path_from_id().is_some() {
+        return Err(format!(
+            "{} {} is not hostname-form; RTCP does not accept DID URL/path forms",
+            context,
+            did.to_string()
+        ));
+    }
+
+    let host = did.to_host_name();
+    if host.is_empty() || host.contains('/') || host.contains('?') || host.contains('#') {
+        return Err(format!(
+            "{} {} resolves to invalid RTCP DID hostname '{}'",
+            context,
+            did.to_string(),
+            host
+        ));
+    }
+
+    Ok(())
 }
 
 // Authority forms supported:
@@ -84,35 +111,49 @@ impl RTcpTargetStackEP {
 // The bootstrap URL must be percent-encoded in its entirety; the only raw '@'
 // that may appear in the input is the separator between params and remote.
 pub(crate) fn parse_rtcp_stack_id(stack_id: &str) -> Option<RTcpTargetStackEP> {
+    parse_rtcp_stack_id_checked(stack_id).ok()
+}
+
+pub(crate) fn parse_rtcp_stack_id_checked(
+    stack_id: &str,
+) -> std::result::Result<RTcpTargetStackEP, String> {
     let (bootstrap_stream_url, remote_part) = match stack_id.rsplit_once('@') {
         Some((params, remote)) => {
             if params.is_empty() {
-                return None;
+                return Err("bootstrap URL prefix is empty".to_string());
             }
-            let decoded = percent_decode_str(params).decode_utf8().ok()?.into_owned();
+            if remote.is_empty() {
+                return Err("remote DID is empty".to_string());
+            }
+            if params.contains('@') {
+                return Err("bootstrap URL prefix contains an unencoded '@'".to_string());
+            }
+            let decoded = percent_decode_str(params)
+                .decode_utf8()
+                .map_err(|e| format!("bootstrap URL prefix is not valid UTF-8: {e}"))?
+                .into_owned();
             if decoded.is_empty() {
-                return None;
+                return Err("decoded bootstrap URL prefix is empty".to_string());
             }
             (Some(decoded), remote)
         }
         None => (None, stack_id),
     };
 
-    let mut stack_port = DEFAULT_RTCP_STACK_PORT;
-    let target_did = if remote_part.contains(':') {
-        let mut parts = remote_part.split(':');
-        let target_host_name = parts.next().unwrap();
-        stack_port = parts.next().unwrap().parse::<u16>().ok()?;
-        DID::from_str(target_host_name)
-    } else {
-        DID::from_str(remote_part)
+    let (target_host_name, stack_port) = match remote_part.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !port.is_empty() => match port.parse::<u16>() {
+            Ok(port) => (host, port),
+            Err(_) if remote_part.starts_with("did:") => (remote_part, DEFAULT_RTCP_STACK_PORT),
+            Err(_) => return Err(format!("invalid RTCP stack port '{}'", port)),
+        },
+        Some(_) => return Err("invalid RTCP stack id host/port form".to_string()),
+        None => (remote_part, DEFAULT_RTCP_STACK_PORT),
     };
-    if target_did.is_err() {
-        return None;
-    }
-    let target_did = target_did.unwrap();
+    let target_did = DID::from_str(target_host_name)
+        .map_err(|e| format!("invalid RTCP remote DID '{}': {}", target_host_name, e))?;
+    validate_rtcp_hostname_form_did(&target_did, "rtcp remote did")?;
 
-    Some(RTcpTargetStackEP {
+    Ok(RTcpTargetStackEP {
         did: target_did,
         stack_port,
         bootstrap_stream_url,
@@ -176,6 +217,18 @@ mod tests {
     }
 
     #[test]
+    fn parse_dev_did_with_and_without_port() {
+        let dev_did = "did:dev:abcdefghijklmnopqrstuvwxyzABCDE";
+        let ep = parse_rtcp_stack_id(dev_did).expect("parse");
+        assert_eq!(ep.did.to_string(), dev_did);
+        assert_eq!(ep.stack_port, DEFAULT_RTCP_STACK_PORT);
+
+        let ep = parse_rtcp_stack_id(&format!("{}:2981", dev_did)).expect("parse");
+        assert_eq!(ep.did.to_string(), dev_did);
+        assert_eq!(ep.stack_port, 2981);
+    }
+
+    #[test]
     fn parse_bootstrap_url_prefix() {
         let bootstrap = "socks://aaa:bbb@pub.proxy.com/remote.com";
         let encoded = utf8_percent_encode(bootstrap, NON_ALPHANUMERIC).to_string();
@@ -188,6 +241,38 @@ mod tests {
     #[test]
     fn parse_rejects_empty_params() {
         assert!(parse_rtcp_stack_id("@remote.com:2981").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_empty_remote_part() {
+        let bootstrap = Url::parse("rtcp://relay.example.com:2993/bootstrap:1").unwrap();
+        let encoded = utf8_percent_encode(bootstrap.as_str(), NON_ALPHANUMERIC).to_string();
+        assert!(parse_rtcp_stack_id(&format!("{}@", encoded)).is_none());
+    }
+
+    #[test]
+    fn parse_rejects_invalid_remote_port() {
+        assert!(parse_rtcp_stack_id("remote.com:not-a-port").is_none());
+        assert!(parse_rtcp_stack_id("remote.com:99999").is_none());
+    }
+
+    #[test]
+    fn parse_rejects_did_url_path_forms() {
+        assert!(parse_rtcp_stack_id("did:web:example.com:user:alice").is_none());
+        assert!(parse_rtcp_stack_id("did:bns:device:scoped").is_none());
+        assert!(parse_rtcp_stack_id("example.com/user:2981").is_none());
+
+        let err = parse_rtcp_stack_id_checked("did:web:example.com:user:alice")
+            .expect_err("path DID should be rejected");
+        assert!(err.contains("hostname-form"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn parse_rejects_unencoded_bootstrap_url_with_raw_at() {
+        assert!(
+            parse_rtcp_stack_id("socks://aaa:bbb@pub.proxy.com/remote.com@remote.com:2981")
+                .is_none()
+        );
     }
 
     #[test]

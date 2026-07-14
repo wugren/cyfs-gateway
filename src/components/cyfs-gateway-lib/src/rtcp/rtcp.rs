@@ -15,6 +15,7 @@ use crate::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use buckyos_kit::{AsyncStream, buckyos_get_unix_timestamp};
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use hex::ToHex;
@@ -283,6 +284,13 @@ struct ResolvedHandshakeIdentity {
     ed25519_pk_der: [u8; 32],
 }
 
+struct VerifiedSourceDevice {
+    source_device_id: String,
+    canonical_dev_did: DID,
+    source_device_info: Option<RTcpSourceDeviceInfo>,
+    public_key: DecodingKey,
+}
+
 // Decode a hex-encoded 32-byte X25519 public key. Used by both Hello and
 // HelloAck JWT verification paths.
 fn decode_x25519_pub_hex(hex_str: &str) -> Result<[u8; 32], TunnelError> {
@@ -293,6 +301,11 @@ fn decode_x25519_pub_hex(hex_str: &str) -> Result<[u8; 32], TunnelError> {
     })
 }
 
+fn canonical_dev_did_from_ed25519_pk(ed25519_pk_der: &[u8; 32]) -> DID {
+    let pkx = URL_SAFE_NO_PAD.encode(ed25519_pk_der);
+    DID::new("dev", &pkx)
+}
+
 struct RTcpInner {
     tunnel_map: RTcpTunnelMap,
     stream_helper: RTcpStreamBuildHelper,
@@ -301,6 +314,7 @@ struct RTcpInner {
     bind_addr: String,
     reuse_address: bool,
     this_device_did: DID, //name or did
+    this_device_dev_did: DID,
     this_device_ed25519_sk: Option<EncodingKey>,
     this_device_doc_jwt: Option<String>,
     // Used by create_tunnel to build a bootstrap stream through the tunnel
@@ -468,6 +482,7 @@ impl RTcpInner {
     async fn resolve_handshake_identity(
         remote_did: &DID,
     ) -> Result<ResolvedHandshakeIdentity, String> {
+        validate_rtcp_hostname_form_did(remote_did, "rtcp handshake did")?;
         debug!(
             "resolve handshake identity for remote device {}",
             remote_did.to_string()
@@ -560,28 +575,87 @@ impl RTcpInner {
         }
     }
 
-    async fn validate_hello_target(token_to: &str, this_host: &str) -> Result<(), String> {
+    async fn resolve_remote_tunnel_dev_did(&self, remote_did: &DID) -> TunnelResult<DID> {
+        let identity = Self::resolve_handshake_identity(remote_did)
+            .await
+            .map_err(|e| {
+                TunnelError::DocumentError(format!(
+                    "resolve remote device {} canonical did:dev failed: {}",
+                    remote_did.to_string(),
+                    e
+                ))
+            })?;
+        let canonical_dev_did = canonical_dev_did_from_ed25519_pk(&identity.ed25519_pk_der);
+        if identity.did.to_string() != canonical_dev_did.to_string() {
+            debug!(
+                "rtcp remote {} resolved to canonical tunnel device {}",
+                remote_did.to_string(),
+                canonical_dev_did.to_string()
+            );
+        }
+        Ok(canonical_dev_did)
+    }
+
+    fn format_tunnel_key(
+        &self,
+        remote_dev_did: &DID,
+        bootstrap_stream_url: Option<&str>,
+    ) -> String {
+        match bootstrap_stream_url {
+            Some(bootstrap_url) => format!(
+                "{}_{}|bootstrap={}",
+                self.this_device_dev_did.to_string(),
+                remote_dev_did.to_string(),
+                bootstrap_url
+            ),
+            None => format!(
+                "{}_{}",
+                self.this_device_dev_did.to_string(),
+                remote_dev_did.to_string()
+            ),
+        }
+    }
+
+    async fn validate_hello_target(
+        token_to: &str,
+        this_host: &str,
+        this_dev_did: &DID,
+    ) -> Result<(), String> {
         if token_to == this_host {
             return Ok(());
         }
 
         let target_did = DID::from_str(token_to)
             .map_err(|e| format!("token.to {} is not a valid DID: {}", token_to, e))?;
+        // token.to 指向当前 stack 的 did(did 字符串形式)或当前 stack 的
+        // did:dev:xxx 规范形式(字符串或 host_name 形式)都可以接受。
+        if target_did == *this_dev_did || target_did.to_host_name() == this_host {
+            return Ok(());
+        }
+
         if target_did.method != "web" {
             return Err(format!(
-                "token.to {} is not this device {} and is not a web alias",
-                token_to, this_host
+                "token.to {} is not this device {} ({}) and is not a web alias",
+                token_to,
+                this_host,
+                this_dev_did.to_string()
             ));
         }
 
         let resolved_identity = Self::resolve_handshake_identity(&target_did).await?;
+        if resolved_identity.did == *this_dev_did {
+            return Ok(());
+        }
         let resolved_host = resolved_identity.did.to_host_name();
         if resolved_host == this_host {
             Ok(())
         } else {
             Err(format!(
-                "token.to {} resolves to {}, not this device {}",
-                token_to, resolved_host, this_host
+                "token.to {} resolves to {}, not this device {} ({})",
+                token_to,
+                resolved_host,
+                this_host,
+                this_dev_did.to_string()
             ))
         }
     }
@@ -738,6 +812,18 @@ impl RTcpInner {
         let this_device_ed25519_sk = private_key_pkcs8_bytes
             .as_ref()
             .map(|bytes| EncodingKey::from_ed_der(bytes));
+        let this_device_dev_did = private_key_pkcs8_bytes
+            .as_ref()
+            .map(|bytes| DID::new("dev", &encode_ed25519_pkcs8_sk_to_pk(bytes)))
+            .unwrap_or_else(|| {
+                if this_device_did.method != "dev" {
+                    warn!(
+                        "rtcp {} has no private key; tunnel key local side cannot be canonicalized to did:dev",
+                        this_device_did.to_string()
+                    );
+                }
+                this_device_did.clone()
+            });
 
         let result = RTcpInner {
             tunnel_map: RTcpTunnelMap::new(),
@@ -747,6 +833,7 @@ impl RTcpInner {
             bind_addr,
             reuse_address: false,
             this_device_did,
+            this_device_dev_did,
             this_device_ed25519_sk, //for sign tunnel token
             this_device_doc_jwt,
             tunnel_manager: None,
@@ -765,7 +852,7 @@ impl RTcpInner {
 
     fn fresh_nonce_hex() -> String {
         let mut nonce_bytes = [0u8; 16];
-        rand::thread_rng().fill(&mut nonce_bytes);
+        rand::rng().fill(&mut nonce_bytes);
         nonce_bytes.encode_hex()
     }
 
@@ -948,65 +1035,95 @@ impl RTcpInner {
         Ok((xpub_bytes, payload))
     }
 
-    async fn resolve_source_device_info(
+    // 使用 payload 声明的 owner 验证 device document JWT。RTCP 层负责握手
+    // 身份证明；更高层授权仍需按配置锚定允许的 owner/zone。
+    async fn verify_source_device_doc_self_declared(
         hello_body: &RTcpHelloBody,
-    ) -> Result<(String, Option<RTcpSourceDeviceInfo>, DecodingKey), TunnelError> {
-        if let Some(device_doc_jwt) = hello_body.device_doc_jwt.as_ref() {
-            let unverified_doc =
-                DeviceConfig::decode(&EncodedDocument::Jwt(device_doc_jwt.clone()), None).map_err(
-                    |e| {
-                        TunnelError::DocumentError(format!(
-                            "decode device_doc_jwt without verify failed:{}",
-                            e
-                        ))
-                    },
-                )?;
-            let owner_public_key = resolve_auth_key(&unverified_doc.owner, None)
-                .await
+        device_doc_jwt: &str,
+    ) -> Result<VerifiedSourceDevice, TunnelError> {
+        let unverified_doc =
+            DeviceConfig::decode(&EncodedDocument::Jwt(device_doc_jwt.to_string()), None)
                 .map_err(|e| {
                     TunnelError::DocumentError(format!(
-                        "resolve owner auth key for {} failed:{}",
-                        unverified_doc.owner.to_string(),
+                        "decode device_doc_jwt without verify failed:{}",
                         e
                     ))
                 })?;
-            let verified_doc = DeviceConfig::decode(
-                &EncodedDocument::Jwt(device_doc_jwt.clone()),
-                Some(&owner_public_key),
-            )
+        let owner_public_key = resolve_auth_key(&unverified_doc.owner, None)
+            .await
             .map_err(|e| {
-                TunnelError::DocumentError(format!("verify device_doc_jwt failed:{}", e))
+                TunnelError::DocumentError(format!(
+                    "resolve owner auth key for {} failed:{}",
+                    unverified_doc.owner.to_string(),
+                    e
+                ))
             })?;
-            //注意:此时不能使用did:dev:xxx的形式，必须用name did的形式
-            if verified_doc.id.to_string() != hello_body.from_id {
-                return Err(TunnelError::DocumentError(format!(
-                    "hello from_id {} not match device_doc_jwt id {}",
-                    hello_body.from_id,
-                    verified_doc.id.to_string()
-                )));
-            }
-            let default_key = verified_doc.get_default_key().ok_or_else(|| {
-                TunnelError::DocumentError("device_doc_jwt missing default key".to_string())
-            })?;
-            let ed25519_pk = jwk_to_ed25519_pk(&default_key).map_err(|e| {
-                TunnelError::DocumentError(format!("decode device_doc_jwt public key failed:{}", e))
-            })?;
-            let from_public_key = DecodingKey::from_ed_der(&ed25519_pk);
-            return Ok((
+        let verified_doc = DeviceConfig::decode(
+            &EncodedDocument::Jwt(device_doc_jwt.to_string()),
+            Some(&owner_public_key),
+        )
+        .map_err(|e| TunnelError::DocumentError(format!("verify device_doc_jwt failed:{}", e)))?;
+        //注意:此时不能使用did:dev:xxx的形式，必须用name did的形式
+        if verified_doc.id.to_string() != hello_body.from_id {
+            return Err(TunnelError::DocumentError(format!(
+                "hello from_id {} not match device_doc_jwt id {}",
+                hello_body.from_id,
+                verified_doc.id.to_string()
+            )));
+        }
+        let default_key = verified_doc.get_default_key().ok_or_else(|| {
+            TunnelError::DocumentError("device_doc_jwt missing default key".to_string())
+        })?;
+        let ed25519_pk = jwk_to_ed25519_pk(&default_key).map_err(|e| {
+            TunnelError::DocumentError(format!("decode device_doc_jwt public key failed:{}", e))
+        })?;
+        // 只缓存 DID 文档，不更新 device_info；缓存失败不影响已完成的握手验证。
+        if let Err(e) = update_did_cache(
+            verified_doc.id.clone(),
+            None,
+            EncodedDocument::Jwt(device_doc_jwt.to_string()),
+        )
+        .await
+        {
+            warn!(
+                "cache verified device_doc for {} failed: {}",
                 verified_doc.id.to_string(),
-                Some(RTcpSourceDeviceInfo {
-                    device_doc_jwt: Some(device_doc_jwt.clone()),
-                    name: Some(verified_doc.name.clone()),
-                    owner: Some(verified_doc.owner.to_string()),
-                    zone_did: verified_doc.zone_did.map(|did| did.to_string()),
-                }),
-                from_public_key,
-            ));
+                e
+            );
+        }
+        let from_public_key = DecodingKey::from_ed_der(&ed25519_pk);
+        Ok(VerifiedSourceDevice {
+            source_device_id: verified_doc.id.to_string(),
+            canonical_dev_did: canonical_dev_did_from_ed25519_pk(&ed25519_pk),
+            source_device_info: Some(RTcpSourceDeviceInfo {
+                device_doc_jwt: Some(device_doc_jwt.to_string()),
+                name: Some(verified_doc.name.clone()),
+                owner: Some(verified_doc.owner.to_string()),
+                zone_did: verified_doc.zone_did.map(|did| did.to_string()),
+            }),
+            public_key: from_public_key,
+        })
+    }
+
+    async fn resolve_source_device_info(
+        hello_body: &RTcpHelloBody,
+    ) -> Result<VerifiedSourceDevice, TunnelError> {
+        if let Some(device_doc_jwt) = hello_body.device_doc_jwt.as_ref() {
+            return Self::verify_source_device_doc_self_declared(hello_body, device_doc_jwt).await;
         }
 
         let from_did = DID::from_str(hello_body.from_id.as_str()).map_err(|_e| {
             TunnelError::DocumentError("invalid from device is not did".to_string())
         })?;
+        // from 是逻辑名字(非 did:dev:xxx)时必须带 device_doc_jwt:逻辑名字
+        // 的 key 只能由 owner 签名的 device_doc 证明,不允许在握手时反向
+        // 依赖名字解析结果来认证对端。
+        if from_did.method != "dev" {
+            return Err(TunnelError::DocumentError(format!(
+                "hello from_id {} is a logical name (not did:dev), device_doc_jwt is required",
+                hello_body.from_id
+            )));
+        }
         let ed25519_pk = resolve_ed25519_exchange_key(&from_did)
             .await
             .map_err(|op| {
@@ -1017,7 +1134,12 @@ impl RTcpInner {
                 ))
             })?;
         let from_public_key = DecodingKey::from_ed_der(&ed25519_pk);
-        Ok((hello_body.from_id.clone(), None, from_public_key))
+        Ok(VerifiedSourceDevice {
+            source_device_id: hello_body.from_id.clone(),
+            canonical_dev_did: canonical_dev_did_from_ed25519_pk(&ed25519_pk),
+            source_device_info: None,
+            public_key: from_public_key,
+        })
     }
 
     // v2 session-key derivation. Replaces the old SHA256(shared_secret)
@@ -1243,7 +1365,11 @@ impl RTcpInner {
             );
             return;
         }
-        let (source_device_id, source_device_info, source_public_key) = source_device.unwrap();
+        let source_device = source_device.unwrap();
+        let source_device_id = source_device.source_device_id;
+        let source_device_info = source_device.source_device_info;
+        let source_public_key = source_device.public_key;
+        let source_dev_did = source_device.canonical_dev_did;
         let token = hello_package.body.tunnel_token.as_ref().unwrap().clone();
         let source_did = match DID::from_str(source_device_id.as_str()) {
             Ok(did) => did,
@@ -1255,6 +1381,13 @@ impl RTcpInner {
                 return;
             }
         };
+        if let Err(e) = validate_rtcp_hostname_form_did(&source_did, "rtcp hello from_id") {
+            warn!(
+                "reject rtcp tunnel from {} {}: {}",
+                source_device_id, source_addr_log, e
+            );
+            return;
+        }
         let (initiator_xpub_bytes, hello_payload) = match RTcpInner::verify_hello_token(
             &token,
             &source_public_key,
@@ -1273,7 +1406,10 @@ impl RTcpInner {
         // §14.2 anti-replay: every Hello token must bind this responder
         // and must not be replayed within its exp window.
         let this_host = self.this_device_did.to_host_name();
-        if let Err(e) = Self::validate_hello_target(&hello_payload.to, &this_host).await {
+        if let Err(e) =
+            Self::validate_hello_target(&hello_payload.to, &this_host, &self.this_device_dev_did)
+                .await
+        {
             warn!(
                 "reject rtcp tunnel from {} {}: token.to {} not accepted for this device {}: {}",
                 source_device_id, source_addr_log, hello_payload.to, this_host, e
@@ -1289,10 +1425,11 @@ impl RTcpInner {
         // defeating the anti-replay guarantee. See regression test
         // nonce_cache_retains_entry_past_exp_within_leeway.
         let retain_until = hello_payload.exp.saturating_add(JWT_LEEWAY_SECS);
+        let source_dev_device_id = source_dev_did.to_string();
         let fresh = self
             .nonce_cache
             .insert_if_fresh(
-                &source_device_id,
+                source_dev_device_id.as_str(),
                 &hello_payload.nonce,
                 retain_until,
                 now_ts,
@@ -1353,7 +1490,7 @@ impl RTcpInner {
         let my_xpub_hex: String = my_xpub_bytes.encode_hex();
 
         let mut challenge_bytes = [0u8; 16];
-        rand::thread_rng().fill(&mut challenge_bytes);
+        rand::rng().fill(&mut challenge_bytes);
         let challenge_hex: String = challenge_bytes.encode_hex();
 
         let mut bearing: RTcpBearingStream = Box::new(stream);
@@ -1424,12 +1561,7 @@ impl RTcpInner {
             self.listener.clone(),
         );
 
-        //TODO:这里是否应该归一化成，必须使用devcie公钥来做key？
-        let tunnel_key = format!(
-            "{}_{}",
-            self.this_device_did.to_string(),
-            source_device_id.as_str()
-        );
+        let tunnel_key = self.format_tunnel_key(&source_dev_did, None);
         {
             //info!("accept tunnel from {} try get lock",hello_package.body.from_id.as_str());
             if self
@@ -1472,36 +1604,24 @@ impl RTcpInner {
             ));
         }
         let tunnel_stack_id = tunnel_stack_id.unwrap();
-        let remote_stack = parse_rtcp_stack_id(tunnel_stack_id);
-        if remote_stack.is_none() {
-            return Err(TunnelError::ConnectError(format!(
-                "invalid remote stack id:{:?}",
-                remote_stack
-            )));
-        }
-        let remote_stack: RTcpTargetStackEP = remote_stack.unwrap();
-        let remote_device_id = remote_stack.did.to_string();
-
-        // Bootstrap-backed tunnels must NOT collide with direct ones (or with
-        // each other across different bootstrap transports), or routing,
-        // credentials and isolation semantics from one bootstrap path could
-        // bleed into another reusing the same remote did. Tag the reuse key
-        // with the bootstrap URL when present.
-        let tunnel_key = match remote_stack.bootstrap_stream_url.as_ref() {
-            Some(bootstrap_url) => format!(
-                "{}_{}|bootstrap={}",
-                self.this_device_did.to_string(),
-                remote_device_id.as_str(),
-                bootstrap_url
-            ),
-            None => format!(
-                "{}_{}",
-                self.this_device_did.to_string(),
-                remote_device_id.as_str()
-            ),
-        };
+        let remote_stack = parse_rtcp_stack_id_checked(tunnel_stack_id).map_err(|e| {
+            TunnelError::ConnectError(format!(
+                "invalid remote stack id '{}': {}",
+                tunnel_stack_id, e
+            ))
+        })?;
+        let target_device_id = remote_stack.did.to_string();
+        let remote_dev_did = self
+            .resolve_remote_tunnel_dev_did(&remote_stack.did)
+            .await?;
+        let remote_device_id = remote_dev_did.to_string();
+        let tunnel_key = self.format_tunnel_key(
+            &remote_dev_did,
+            remote_stack.bootstrap_stream_url.as_deref(),
+        );
         debug!(
-            "will create tunnel to {} ,tunnel key is {},try reuse",
+            "will create tunnel to {} (canonical {}), tunnel key is {}, try reuse",
+            target_device_id.as_str(),
             remote_device_id.as_str(),
             tunnel_key.as_str()
         );
@@ -1547,7 +1667,7 @@ impl RTcpInner {
                 .map_err(|e| {
                     let msg = format!(
                         "open bootstrap stream '{}' for {} failed: {}",
-                        bootstrap_url, remote_device_id, e
+                        bootstrap_url, target_device_id, e
                     );
                     error!("{}", msg);
                     TunnelError::ConnectError(msg)
@@ -1659,8 +1779,8 @@ impl RTcpInner {
         // address ordering based on its RFC 8305 / addr-rtt policy.
         let resolve_name = remote_stack.did.to_string();
         debug!(
-            "resolve remote device {} ips by {}",
-            remote_device_id, resolve_name
+            "resolve remote device {} (canonical {}) ips by {}",
+            target_device_id, remote_device_id, resolve_name
         );
 
         let candidate_ips =
@@ -1669,7 +1789,7 @@ impl RTcpInner {
                 Ok(_) => {
                     let msg = format!(
                         "cann't resolve remote device {} ip by {}: empty address list",
-                        remote_device_id, resolve_name
+                        target_device_id, resolve_name
                     );
                     error!("{}", msg);
                     return Err(TunnelError::DocumentError(msg));
@@ -1677,7 +1797,7 @@ impl RTcpInner {
                 Err(err) => {
                     let msg = format!(
                         "cann't resolve remote device {} ip by {}: {}",
-                        remote_device_id, resolve_name, err
+                        target_device_id, resolve_name, err
                     );
                     error!("{}", msg);
                     return Err(TunnelError::DocumentError(msg));
@@ -1763,25 +1883,19 @@ impl RTcpInner {
 
         Err(TunnelError::ConnectError(format!(
             "connect to remote {} failed after trying all candidates: {}",
-            remote_device_id,
+            target_device_id,
             connect_errors.join("; ")
         )))
     }
 
-    fn compute_tunnel_key(&self, remote_stack: &RTcpTargetStackEP) -> String {
-        match remote_stack.bootstrap_stream_url.as_ref() {
-            Some(bootstrap_url) => format!(
-                "{}_{}|bootstrap={}",
-                self.this_device_did.to_string(),
-                remote_stack.did.to_string(),
-                bootstrap_url
-            ),
-            None => format!(
-                "{}_{}",
-                self.this_device_did.to_string(),
-                remote_stack.did.to_string()
-            ),
-        }
+    async fn compute_tunnel_key(&self, remote_stack: &RTcpTargetStackEP) -> TunnelResult<String> {
+        let remote_dev_did = self
+            .resolve_remote_tunnel_dev_did(&remote_stack.did)
+            .await?;
+        Ok(self.format_tunnel_key(
+            &remote_dev_did,
+            remote_stack.bootstrap_stream_url.as_deref(),
+        ))
     }
 
     pub async fn probe_url(
@@ -1801,19 +1915,30 @@ impl RTcpInner {
                 "rtcp url has no remote stack id".to_string(),
             ));
         }
-        let remote_stack = match parse_rtcp_stack_id(stack_id) {
-            Some(s) => s,
-            None => {
+        let remote_stack = match parse_rtcp_stack_id_checked(stack_id) {
+            Ok(s) => s,
+            Err(e) => {
                 return Ok(unreachable_status(
                     url,
                     &normalized,
                     now,
                     TunnelUrlStatusSource::FreshProbe,
-                    format!("invalid rtcp stack id '{}'", stack_id),
+                    format!("invalid rtcp stack id '{}': {}", stack_id, e),
                 ));
             }
         };
-        let tunnel_key = self.compute_tunnel_key(&remote_stack);
+        let tunnel_key = match self.compute_tunnel_key(&remote_stack).await {
+            Ok(key) => key,
+            Err(e) => {
+                return Ok(unreachable_status(
+                    url,
+                    &normalized,
+                    now,
+                    TunnelUrlStatusSource::FreshProbe,
+                    format!("compute_tunnel_key: {}", e),
+                ));
+            }
+        };
         let timeout_dur = Duration::from_millis(options.timeout_ms_or_default());
 
         // 1. Existing tunnel: ping it (force_probe just bypasses the
@@ -2256,7 +2381,19 @@ impl RTcpTunnel {
                 let _ = RTcpTunnelPackage::send_package(write_stream, pong_package).await?;
                 return Ok(());
             }
-            RTcpTunnelPackage::ROpen(ropen_package) => self.on_ropen(ropen_package).await,
+            RTcpTunnelPackage::ROpen(ropen_package) => {
+                // ROpen may build a new transport leg and then hand the
+                // stream to a long-lived listener. Keep the tunnel control
+                // read loop free so concurrent Open/ROpen responses are not
+                // head-of-line blocked behind that business stream.
+                let this = self.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = this.on_ropen(ropen_package).await {
+                        error!("RTcp on_ropen background task error: {}", e);
+                    }
+                });
+                Ok(())
+            }
             RTcpTunnelPackage::ROpenResp(ropen_resp_package) => {
                 // Deliver the result code to the post_ropen waiter. A
                 // non-zero result tells the initiator no HelloStream is
@@ -3427,6 +3564,7 @@ mod tests {
     use std::collections::HashMap;
     use std::net::SocketAddr;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt, copy_bidirectional};
 
     // §14.2 regression: the nonce cache retention window must cover the
@@ -3532,9 +3670,202 @@ mod tests {
             Some(server_id.to_host_name().as_str())
         );
         assert_eq!(state.responder_did, server_id.to_host_name());
-        RTcpInner::validate_hello_target("sn.devtests.org", server_id.to_host_name().as_str())
+        RTcpInner::validate_hello_target(
+            "sn.devtests.org",
+            server_id.to_host_name().as_str(),
+            &server_id,
+        )
+        .await
+        .unwrap();
+    }
+
+    fn ed25519_test_keys() -> (EncodingKey, DecodingKey) {
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+        let device_config =
+            DeviceConfig::new_by_jwk("key-test", serde_json::from_value(jwk).unwrap());
+        let default_key = device_config.get_default_key().unwrap();
+        let public_key = jwk_to_ed25519_pk(&default_key).unwrap();
+        (
+            EncodingKey::from_ed_der(&pkcs8_bytes),
+            DecodingKey::from_ed_der(&public_key),
+        )
+    }
+
+    #[test]
+    fn test_rtcp_verify_hello_token_rejects_from_binding_and_bad_xpub() {
+        let (encoding_key, decoding_key) = ed25519_test_keys();
+        let payload = TunnelTokenPayload {
+            aud: RTCP_HELLO_AUD.to_string(),
+            to: "did:web:responder.example.com".to_string(),
+            from: "did:web:initiator.example.com".to_string(),
+            xpub: hex::encode([1u8; 32]),
+            exp: buckyos_get_unix_timestamp() + TUNNEL_TOKEN_EXP_SECS,
+            nonce: hex::encode([2u8; 16]),
+        };
+        let token = RTcpInner::sign_jwt(&encoding_key, &payload).unwrap();
+
+        RTcpInner::verify_hello_token(&token, &decoding_key, Some("did:web:initiator.example.com"))
+            .unwrap();
+
+        let err = RTcpInner::verify_hello_token(
+            &token,
+            &decoding_key,
+            Some("did:web:attacker.example.com"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("not match expected"),
+            "unexpected error: {}",
+            err
+        );
+
+        let mut bad_xpub = payload.clone();
+        bad_xpub.xpub = "abcd".to_string();
+        let bad_xpub_token = RTcpInner::sign_jwt(&encoding_key, &bad_xpub).unwrap();
+        let err = RTcpInner::verify_hello_token(
+            &bad_xpub_token,
+            &decoding_key,
+            Some("did:web:initiator.example.com"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("x25519 pub key"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn test_rtcp_verify_ack_token_rejects_identity_and_peer_xpub_mismatch() {
+        let (encoding_key, decoding_key) = ed25519_test_keys();
+        let expected_from = "did:web:responder.example.com";
+        let expected_to = "did:web:initiator.example.com";
+        let expected_peer_xpub = hex::encode([7u8; 32]);
+        let payload = TunnelAckTokenPayload {
+            aud: RTCP_HELLO_ACK_AUD.to_string(),
+            to: expected_to.to_string(),
+            from: expected_from.to_string(),
+            xpub: hex::encode([8u8; 32]),
+            peer_xpub: expected_peer_xpub.clone(),
+            exp: buckyos_get_unix_timestamp() + TUNNEL_TOKEN_EXP_SECS,
+            nonce: hex::encode([9u8; 16]),
+        };
+        let token = RTcpInner::sign_jwt(&encoding_key, &payload).unwrap();
+
+        RTcpInner::verify_ack_token(
+            &token,
+            &decoding_key,
+            expected_from,
+            expected_to,
+            &expected_peer_xpub,
+        )
+        .unwrap();
+
+        let mut wrong_from = payload.clone();
+        wrong_from.from = "did:web:other-responder.example.com".to_string();
+        let token = RTcpInner::sign_jwt(&encoding_key, &wrong_from).unwrap();
+        assert!(
+            RTcpInner::verify_ack_token(
+                &token,
+                &decoding_key,
+                expected_from,
+                expected_to,
+                &expected_peer_xpub,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("from")
+        );
+
+        let mut wrong_to = payload.clone();
+        wrong_to.to = "did:web:other-initiator.example.com".to_string();
+        let token = RTcpInner::sign_jwt(&encoding_key, &wrong_to).unwrap();
+        assert!(
+            RTcpInner::verify_ack_token(
+                &token,
+                &decoding_key,
+                expected_from,
+                expected_to,
+                &expected_peer_xpub,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("to")
+        );
+
+        let mut wrong_peer_xpub = payload.clone();
+        wrong_peer_xpub.peer_xpub = hex::encode([10u8; 32]);
+        let token = RTcpInner::sign_jwt(&encoding_key, &wrong_peer_xpub).unwrap();
+        assert!(
+            RTcpInner::verify_ack_token(
+                &token,
+                &decoding_key,
+                expected_from,
+                expected_to,
+                &expected_peer_xpub,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("peer_xpub")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_validate_hello_target_rejects_non_web_alias() {
+        let this_host = "did:web:this.example.com";
+        let this_dev_did = DID::new("dev", "hello-target-reject-dev");
+        RTcpInner::validate_hello_target(this_host, this_host, &this_dev_did)
             .await
             .unwrap();
+
+        let err = RTcpInner::validate_hello_target("did:test:other", this_host, &this_dev_did)
+            .await
+            .unwrap_err();
+        assert!(
+            err.contains("not this device") || err.contains("not a valid DID"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_validate_hello_target_accepts_this_dev_did_forms() {
+        // stack 配置了逻辑 did(this_host 为其 host_name 形式),token.to 用
+        // 当前 stack 的 did:dev:xxx 形式(字符串或 host_name)也必须通过。
+        let (device_config, _pkcs8_bytes) = test_device_config("hello-target-dev");
+        let this_dev_did = device_config.id.clone();
+        let this_host = "sn.devtests.org";
+
+        RTcpInner::validate_hello_target(
+            this_dev_did.to_string().as_str(),
+            this_host,
+            &this_dev_did,
+        )
+        .await
+        .unwrap();
+        RTcpInner::validate_hello_target(
+            this_dev_did.to_host_name().as_str(),
+            this_host,
+            &this_dev_did,
+        )
+        .await
+        .unwrap();
+        // 逻辑 did 的字符串形式(this_host 的 did:web 形式)同样接受。
+        RTcpInner::validate_hello_target("did:web:sn.devtests.org", this_host, &this_dev_did)
+            .await
+            .unwrap();
+
+        // 其它设备的 did:dev 仍然拒绝。
+        let (other_config, _other_pkcs8_bytes) = test_device_config("hello-target-other");
+        let err = RTcpInner::validate_hello_target(
+            other_config.id.to_string().as_str(),
+            this_host,
+            &this_dev_did,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("not this device"), "unexpected error: {}", err);
     }
 
     #[test]
@@ -3557,13 +3888,13 @@ mod tests {
         assert!(true);
     }
 
-    // Mock实现用于测试
-    struct MockRTcpListener;
-
-    impl MockRTcpListener {
-        fn new() -> Self {
-            MockRTcpListener {}
-        }
+    fn test_device_config(name: &str) -> (DeviceConfig, [u8; 48]) {
+        let (signing_key, pkcs8_bytes) = generate_ed25519_key();
+        let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
+        (
+            DeviceConfig::new_by_jwk(name, serde_json::from_value(jwk).unwrap()),
+            pkcs8_bytes,
+        )
     }
 
     fn available_tcp_port_pair() -> (u16, u16) {
@@ -3572,6 +3903,318 @@ mod tests {
         let port1 = listener1.local_addr().unwrap().port();
         let port2 = listener2.local_addr().unwrap().port();
         (port1, port2)
+    }
+
+    async fn add_rtcp_alias(name: &str, dev_did: &DID) {
+        let mut name_info = NameInfo::from_address(name, "127.0.0.1".parse().unwrap());
+        name_info.txt.push(format!("PKX={};", dev_did.id));
+        add_nameinfo_cache(name, name_info).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_bootstrap_url_requires_tunnel_manager() {
+        let bootstrap_url = Url::parse("tcp://127.0.0.1:9/bootstrap").unwrap();
+        let (remote_config, _) = test_device_config("bootstrap-remote");
+        let remote = remote_config.id.to_string();
+        let stack_id = build_rtcp_nested_remote_stack_id(&bootstrap_url, &remote, Some(2981));
+        let inner = RTcpInner::new(
+            DID::new("dev", "local-dev-without-sk-for-bootstrap-test"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+
+        let err = match inner.create_tunnel(Some(&stack_id)).await {
+            Ok(_) => panic!("bootstrap tunnel creation should fail without tunnel_manager"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("tunnel_manager is not set"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            inner
+                .tunnel_map
+                .get_tunnel(
+                    &inner
+                        .compute_tunnel_key(&parse_rtcp_stack_id(&stack_id).unwrap())
+                        .await
+                        .unwrap()
+                )
+                .await
+                .is_none(),
+            "failed bootstrap setup must not register a tunnel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_bootstrap_stream_open_failure_does_not_register_tunnel() {
+        let create_count = Arc::new(AtomicUsize::new(0));
+        let open_count = Arc::new(AtomicUsize::new(0));
+        let tunnel_manager = TunnelManager::new();
+        tunnel_manager.register_tunnel_builder(
+            "mockfail",
+            Arc::new(FailingBootstrapTunnelBuilder {
+                create_count: create_count.clone(),
+                open_count: open_count.clone(),
+            }),
+        );
+
+        let bootstrap_url = Url::parse("mockfail://bootstrap.example/rtcp-bearing").unwrap();
+        let (remote_config, _) = test_device_config("bootstrap-fail-remote");
+        let remote = remote_config.id.to_string();
+        let stack_id = build_rtcp_nested_remote_stack_id(&bootstrap_url, &remote, Some(2981));
+        let mut inner = RTcpInner::new(
+            DID::new("dev", "local-dev-without-sk-for-bootstrap-fail-test"),
+            "127.0.0.1:0".to_string(),
+            None,
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        inner.tunnel_manager = Some(tunnel_manager);
+
+        let err = match inner.create_tunnel(Some(&stack_id)).await {
+            Ok(_) => panic!("bootstrap tunnel creation should fail when bootstrap stream fails"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string().contains("open bootstrap stream"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(create_count.load(Ordering::SeqCst), 1);
+        assert_eq!(open_count.load(Ordering::SeqCst), 1);
+        assert!(
+            inner
+                .tunnel_map
+                .get_tunnel(
+                    &inner
+                        .compute_tunnel_key(&parse_rtcp_stack_id(&stack_id).unwrap())
+                        .await
+                        .unwrap()
+                )
+                .await
+                .is_none(),
+            "failed bootstrap stream setup must not register a tunnel"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_tunnel_key_separates_direct_and_bootstrap_paths() {
+        let (local_config, local_pkcs8_bytes) = test_device_config("key-local");
+        let (remote_config, _) = test_device_config("key-remote");
+        let inner = RTcpInner::new(
+            local_config.id.clone(),
+            "127.0.0.1:0".to_string(),
+            Some(local_pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        let remote = remote_config.id.to_string();
+        let direct = parse_rtcp_stack_id(&format!("{}:2981", remote)).unwrap();
+        let bootstrap_a = Url::parse("rtcp://relay-a.example.com:2993/remote:2981").unwrap();
+        let bootstrap_b = Url::parse("rtcp://relay-b.example.com:2993/remote:2981").unwrap();
+        let nested_a = parse_rtcp_stack_id(&build_rtcp_nested_remote_stack_id(
+            &bootstrap_a,
+            &remote,
+            Some(2981),
+        ))
+        .unwrap();
+        let nested_b = parse_rtcp_stack_id(&build_rtcp_nested_remote_stack_id(
+            &bootstrap_b,
+            &remote,
+            Some(2981),
+        ))
+        .unwrap();
+
+        let direct_key = inner.compute_tunnel_key(&direct).await.unwrap();
+        let nested_a_key = inner.compute_tunnel_key(&nested_a).await.unwrap();
+        let nested_b_key = inner.compute_tunnel_key(&nested_b).await.unwrap();
+
+        assert_ne!(direct_key, nested_a_key);
+        assert_ne!(nested_a_key, nested_b_key);
+        assert_eq!(
+            direct_key,
+            format!(
+                "{}_{}",
+                local_config.id.to_string(),
+                remote_config.id.to_string()
+            )
+        );
+        assert!(!direct_key.contains("|bootstrap="));
+        assert!(nested_a_key.contains("|bootstrap=rtcp://relay-a.example.com:2993/remote:2981"));
+        assert!(nested_b_key.contains("|bootstrap=rtcp://relay-b.example.com:2993/remote:2981"));
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_tunnel_key_uses_resolved_dev_did_for_name_reset() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+
+        let (local_config, local_pkcs8_bytes) = test_device_config("name-reset-local");
+        let (dev_a_config, dev_a_pkcs8_bytes) = test_device_config("name-reset-a");
+        let (dev_b_config, dev_b_pkcs8_bytes) = test_device_config("name-reset-b");
+        let alias = "rtcp-name-reset.devtests.org";
+
+        let (port_local, port_a, port_b) = {
+            let local = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let a = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let b = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            (
+                local.local_addr().unwrap().port(),
+                a.local_addr().unwrap().port(),
+                b.local_addr().unwrap().port(),
+            )
+        };
+
+        let mut rtcp_local = RTcp::new(
+            local_config.id.clone(),
+            format!("127.0.0.1:{}", port_local),
+            Some(local_pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        rtcp_local.start().await.unwrap();
+
+        let mut rtcp_a = RTcp::new(
+            dev_a_config.id.clone(),
+            format!("127.0.0.1:{}", port_a),
+            Some(dev_a_pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        rtcp_a.start().await.unwrap();
+
+        add_rtcp_alias(alias, &dev_a_config.id).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let stack_id_a = format!("{}:{}", alias, port_a);
+        let tunnel_a = rtcp_local
+            .create_tunnel(Some(stack_id_a.as_str()))
+            .await
+            .unwrap();
+        tunnel_a.ping().await.unwrap();
+        let key_a = rtcp_local
+            .inner
+            .compute_tunnel_key(&parse_rtcp_stack_id(&stack_id_a).unwrap())
+            .await
+            .unwrap();
+        assert!(key_a.ends_with(dev_a_config.id.to_string().as_str()));
+
+        let mut rtcp_b = RTcp::new(
+            dev_b_config.id.clone(),
+            format!("127.0.0.1:{}", port_b),
+            Some(dev_b_pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        rtcp_b.start().await.unwrap();
+        add_rtcp_alias(alias, &dev_b_config.id).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let stack_id_b = format!("{}:{}", alias, port_b);
+        let tunnel_b = rtcp_local
+            .create_tunnel(Some(stack_id_b.as_str()))
+            .await
+            .unwrap();
+        tunnel_b.ping().await.unwrap();
+        let key_b = rtcp_local
+            .inner
+            .compute_tunnel_key(&parse_rtcp_stack_id(&stack_id_b).unwrap())
+            .await
+            .unwrap();
+
+        assert_ne!(key_a, key_b);
+        assert!(key_b.ends_with(dev_b_config.id.to_string().as_str()));
+        assert!(
+            rtcp_local
+                .inner
+                .tunnel_map
+                .get_tunnel(&key_a)
+                .await
+                .is_some()
+        );
+        assert!(
+            rtcp_local
+                .inner
+                .tunnel_map
+                .get_tunnel(&key_b)
+                .await
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_name_and_dev_did_share_tunnel_key_for_same_device() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (local_config, local_pkcs8_bytes) = test_device_config("name-dev-key-local");
+        let (remote_config, _) = test_device_config("name-dev-key-remote");
+        let alias = "rtcp-same-dev.devtests.org";
+        add_rtcp_alias(alias, &remote_config.id).await;
+
+        let inner = RTcpInner::new(
+            local_config.id.clone(),
+            "127.0.0.1:0".to_string(),
+            Some(local_pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        let by_name = parse_rtcp_stack_id(&format!("{}:2981", alias)).unwrap();
+        let by_dev =
+            parse_rtcp_stack_id(&format!("{}:2981", remote_config.id.to_string())).unwrap();
+        let by_dev_host =
+            parse_rtcp_stack_id(&format!("{}:2981", remote_config.id.to_host_name())).unwrap();
+
+        let key_by_name = inner.compute_tunnel_key(&by_name).await.unwrap();
+        assert_eq!(
+            key_by_name,
+            inner.compute_tunnel_key(&by_dev).await.unwrap()
+        );
+        assert_eq!(
+            key_by_name,
+            inner.compute_tunnel_key(&by_dev_host).await.unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_multiple_names_to_same_dev_share_key_by_design() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+        let (local_config, local_pkcs8_bytes) = test_device_config("multi-name-key-local");
+        let (remote_config, _) = test_device_config("multi-name-key-remote");
+        let alias_a = "rtcp-alias-a.devtests.org";
+        let alias_b = "rtcp-alias-b.devtests.org";
+        add_rtcp_alias(alias_a, &remote_config.id).await;
+        add_rtcp_alias(alias_b, &remote_config.id).await;
+
+        let inner = RTcpInner::new(
+            local_config.id.clone(),
+            "127.0.0.1:0".to_string(),
+            Some(local_pkcs8_bytes),
+            None,
+            Arc::new(MockRTcpListener::new()),
+        );
+        let by_alias_a = parse_rtcp_stack_id(&format!("{}:2981", alias_a)).unwrap();
+        let by_alias_b = parse_rtcp_stack_id(&format!("{}:2981", alias_b)).unwrap();
+
+        // This is intentionally not a compatibility fallback: two logical
+        // device names resolving to the same DEV DID are invalid device
+        // modeling, and RTCP treats them as the same device identity.
+        assert_eq!(
+            inner.compute_tunnel_key(&by_alias_a).await.unwrap(),
+            inner.compute_tunnel_key(&by_alias_b).await.unwrap()
+        );
+    }
+
+    // Mock实现用于测试
+    struct MockRTcpListener;
+
+    impl MockRTcpListener {
+        fn new() -> Self {
+            MockRTcpListener {}
+        }
     }
 
     struct RelayRTcpListener {
@@ -3586,6 +4229,7 @@ mod tests {
 
     struct TestRtcpTunnelBuilder {
         inner: Arc<RTcpInner>,
+        create_count: Option<Arc<AtomicUsize>>,
     }
 
     #[async_trait::async_trait]
@@ -3594,7 +4238,84 @@ mod tests {
             &self,
             tunnel_stack_id: Option<&str>,
         ) -> TunnelResult<Box<dyn TunnelBox>> {
+            if let Some(create_count) = self.create_count.as_ref() {
+                create_count.fetch_add(1, Ordering::SeqCst);
+            }
             self.inner.create_tunnel(tunnel_stack_id).await
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingBootstrapTunnel {
+        open_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl Tunnel for FailingBootstrapTunnel {
+        async fn ping(&self) -> Result<(), std::io::Error> {
+            Ok(())
+        }
+
+        async fn open_stream_by_dest(
+            &self,
+            _dest_port: u16,
+            _dest_host: Option<String>,
+        ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+            self.open_count.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "mock bootstrap stream refused",
+            ))
+        }
+
+        async fn open_stream(
+            &self,
+            _stream_id: &str,
+        ) -> Result<Box<dyn AsyncStream>, std::io::Error> {
+            self.open_count.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionRefused,
+                "mock bootstrap stream refused",
+            ))
+        }
+
+        async fn create_datagram_client_by_dest(
+            &self,
+            _dest_port: u16,
+            _dest_host: Option<String>,
+        ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "mock bootstrap datagram unsupported",
+            ))
+        }
+
+        async fn create_datagram_client(
+            &self,
+            _session_id: &str,
+        ) -> Result<Box<dyn DatagramClientBox>, std::io::Error> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "mock bootstrap datagram unsupported",
+            ))
+        }
+    }
+
+    struct FailingBootstrapTunnelBuilder {
+        create_count: Arc<AtomicUsize>,
+        open_count: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl TunnelBuilder for FailingBootstrapTunnelBuilder {
+        async fn create_tunnel(
+            &self,
+            _tunnel_stack_id: Option<&str>,
+        ) -> TunnelResult<Box<dyn TunnelBox>> {
+            self.create_count.fetch_add(1, Ordering::SeqCst);
+            Ok(Box::new(FailingBootstrapTunnel {
+                open_count: self.open_count.clone(),
+            }))
         }
     }
 
@@ -3609,21 +4330,26 @@ mod tests {
             _remote_addr: SocketAddr,
             _local_addr: SocketAddr,
         ) -> TunnelResult<()> {
-            loop {
-                let mut buf = [0u8; 1024];
-                match stream.read(&mut buf).await {
-                    Ok(n) => {
-                        if n == 0 {
+            tokio::spawn(async move {
+                loop {
+                    let mut buf = [0u8; 1024];
+                    match stream.read(&mut buf).await {
+                        Ok(n) => {
+                            if n == 0 {
+                                break;
+                            }
+                            if let Err(e) = stream.write_all(&buf[0..n]).await {
+                                error!("write error: {}", e);
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            error!("read error: {}", e);
                             break;
                         }
-                        stream.write_all(&buf[0..n]).await.unwrap();
-                    }
-                    Err(e) => {
-                        error!("read error: {}", e);
-                        break;
                     }
                 }
-            }
+            });
             Ok(())
         }
 
@@ -3722,7 +4448,8 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -3750,7 +4477,8 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -3806,7 +4534,8 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let _id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -3834,7 +4563,8 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4023,13 +4753,13 @@ mod tests {
             tunnel_token: Some(state.token.clone()),
             device_doc_jwt: Some(client_device_doc_jwt),
         };
-        let (source_device_id, source_device_info, source_public_key) =
-            RTcpInner::resolve_source_device_info(&hello_body)
-                .await
-                .unwrap();
-        assert_eq!(source_device_id, client_id.to_string());
+        let source_device = RTcpInner::resolve_source_device_info(&hello_body)
+            .await
+            .unwrap();
+        assert_eq!(source_device.source_device_id, client_id.to_string());
+        assert_eq!(source_device.canonical_dev_did, client_id.clone());
         assert_eq!(
-            source_device_info.unwrap().owner,
+            source_device.source_device_info.unwrap().owner,
             Some(owner_did.to_string())
         );
         // server_inner is exercised here just to make sure the test
@@ -4038,10 +4768,79 @@ mod tests {
 
         RTcpInner::verify_hello_token(
             &state.token,
-            &source_public_key,
+            &source_device.public_key,
             Some(client_id.to_host_name().as_str()),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_logical_from_requires_and_caches_device_doc_jwt() {
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
+
+        let (owner_signing_key, owner_pkcs8_bytes) = generate_ed25519_key();
+        let owner_jwk = encode_ed25519_sk_to_pk_jwk(&owner_signing_key);
+        let owner_config =
+            DeviceConfig::new_by_jwk("owner", serde_json::from_value(owner_jwk).unwrap());
+        let owner_did = owner_config.id.clone();
+        let owner_private_key = EncodingKey::from_ed_der(&owner_pkcs8_bytes);
+
+        // 设备文档的 id 是逻辑名字(非 did:dev)，default key 是设备自身的 key。
+        let (client_signing_key, _client_pkcs8_bytes) = generate_ed25519_key();
+        let client_jwk = encode_ed25519_sk_to_pk_jwk(&client_signing_key);
+        let mut client_device_config =
+            DeviceConfig::new_by_jwk("client", serde_json::from_value(client_jwk).unwrap());
+        let client_dev_did = client_device_config.id.clone();
+        let client_logical_did = DID::new("test", "rtcp-logical-client");
+        client_device_config.id = client_logical_did.clone();
+        client_device_config.owner = owner_did.clone();
+        let client_device_doc_jwt = match client_device_config
+            .encode(Some(&owner_private_key))
+            .unwrap()
+        {
+            EncodedDocument::Jwt(jwt) => jwt,
+            _ => panic!("device config encode should return jwt"),
+        };
+
+        // 逻辑名字不带 device_doc_jwt 必须被拒绝。
+        let hello_body_without_jwt = RTcpHelloBody {
+            from_id: client_logical_did.to_string(),
+            to_id: "did:web:server.devtests.org".to_string(),
+            my_port: 19065,
+            tunnel_token: Some("unused".to_string()),
+            device_doc_jwt: None,
+        };
+        let err = match RTcpInner::resolve_source_device_info(&hello_body_without_jwt).await {
+            Ok(_) => panic!("logical from without device_doc_jwt must be rejected"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("device_doc_jwt is required"),
+            "unexpected error: {}",
+            err
+        );
+
+        // 带 device_doc_jwt 时验证通过，并写入 name_client DID 缓存。
+        let hello_body = RTcpHelloBody {
+            from_id: client_logical_did.to_string(),
+            to_id: "did:web:server.devtests.org".to_string(),
+            my_port: 19065,
+            tunnel_token: Some("unused".to_string()),
+            device_doc_jwt: Some(client_device_doc_jwt.clone()),
+        };
+        let source_device = RTcpInner::resolve_source_device_info(&hello_body)
+            .await
+            .unwrap();
+        assert_eq!(
+            source_device.source_device_id,
+            client_logical_did.to_string()
+        );
+        assert_eq!(source_device.canonical_dev_did, client_dev_did);
+
+        let observed = resolve_did(&client_logical_did, None)
+            .await
+            .unwrap();
+        assert_eq!(observed, EncodedDocument::Jwt(client_device_doc_jwt));
     }
 
     #[tokio::test(flavor = "local")]
@@ -4049,7 +4848,8 @@ mod tests {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4077,7 +4877,8 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4136,17 +4937,38 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
 
-    #[tokio::test(flavor = "local")]
-    async fn test_rtcp_nested_remote_rebinds_transport_via_rtcp_relay() {
+    struct NestedRtcpRelayFixture {
+        rtcp_a: RTcp,
+        _rtcp_b: RTcp,
+        _rtcp_c: RTcp,
+        id_a: DID,
+        id_b: DID,
+        id_c: DID,
+        nested_url: Url,
+        tunnel: Box<dyn TunnelBox>,
+        reverse_tunnel: Box<dyn TunnelBox>,
+        bootstrap_create_count: Arc<AtomicUsize>,
+    }
+
+    async fn setup_nested_rtcp_relay_fixture(test_name: &str) -> NestedRtcpRelayFixture {
         let _ = init_name_lib_for_test(&HashMap::new()).await;
-        let port_a = 19173;
-        let port_b = 19174;
-        let port_c = 19175;
+        let (port_a, port_b, port_c) = {
+            let listener_a = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let listener_b = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let listener_c = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            (
+                listener_a.local_addr().unwrap().port(),
+                listener_b.local_addr().unwrap().port(),
+                listener_c.local_addr().unwrap().port(),
+            )
+        };
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config =
-            DeviceConfig::new_by_jwk("test-a", serde_json::from_value(jwk).unwrap());
+        let device_config = DeviceConfig::new_by_jwk(
+            format!("{}-a", test_name).as_str(),
+            serde_json::from_value(jwk).unwrap(),
+        );
         let id_a = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4173,18 +4995,22 @@ mod tests {
         rtcp_a.set_reuse_address(true);
         let tunnel_manager = TunnelManager::new();
         rtcp_a.set_tunnel_manager(tunnel_manager.clone());
+        let bootstrap_create_count = Arc::new(AtomicUsize::new(0));
         tunnel_manager.register_tunnel_builder(
             "rtcp",
             Arc::new(TestRtcpTunnelBuilder {
                 inner: rtcp_a.inner.clone(),
+                create_count: Some(bootstrap_create_count.clone()),
             }),
         );
         rtcp_a.start().await.unwrap();
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config =
-            DeviceConfig::new_by_jwk("test-b", serde_json::from_value(jwk).unwrap());
+        let device_config = DeviceConfig::new_by_jwk(
+            format!("{}-b", test_name).as_str(),
+            serde_json::from_value(jwk).unwrap(),
+        );
         let id_b = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4213,8 +5039,10 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config =
-            DeviceConfig::new_by_jwk("test-c", serde_json::from_value(jwk).unwrap());
+        let device_config = DeviceConfig::new_by_jwk(
+            format!("{}-c", test_name).as_str(),
+            serde_json::from_value(jwk).unwrap(),
+        );
         let id_c = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4272,6 +5100,7 @@ mod tests {
         let nested_remote_stack_id =
             build_rtcp_nested_remote_stack_id(&bootstrap_url, &id_b.to_host_name(), Some(port_b));
 
+        let before_outer_tunnel = bootstrap_create_count.load(Ordering::SeqCst);
         let tunnel = tokio::time::timeout(
             Duration::from_secs(10),
             rtcp_a.create_tunnel(Some(nested_remote_stack_id.as_str())),
@@ -4279,40 +5108,277 @@ mod tests {
         .await
         .expect("nested remote tunnel creation timed out")
         .expect("A should build the outer tunnel to B through C");
+        assert!(
+            bootstrap_create_count.load(Ordering::SeqCst) > before_outer_tunnel,
+            "nested outer tunnel creation must obtain its bearing stream through bootstrap"
+        );
 
         tokio::time::timeout(Duration::from_secs(10), tunnel.ping())
             .await
             .expect("nested remote tunnel ping timed out")
             .expect("nested remote tunnel ping failed");
 
-        let mut stream =
-            tokio::time::timeout(Duration::from_secs(10), tunnel.open_stream("test:80"))
-                .await
-                .expect("nested remote stream open timed out")
-                .expect("A should reach B through C with nested remote rtcp");
-        tokio::time::timeout(Duration::from_secs(10), stream.write_all(b"test"))
-            .await
-            .expect("nested remote stream write timed out")
-            .unwrap();
+        let nested_url = Url::parse(format!("rtcp://{}", nested_remote_stack_id).as_str()).unwrap();
 
-        let mut buf = [0u8; 4];
-        tokio::time::timeout(Duration::from_secs(10), stream.read_exact(&mut buf))
-            .await
-            .expect("nested remote stream read timed out")
-            .unwrap();
-        assert_eq!(&buf, b"test");
+        let reverse_tunnel_key = format!("{}_{}", id_b.to_string(), id_a.to_string());
+        let reverse_tunnel = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(tunnel) = rtcp_b
+                    .inner
+                    .tunnel_map
+                    .get_tunnel(&reverse_tunnel_key)
+                    .await
+                {
+                    break tunnel;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("B-side nested tunnel registration timed out");
 
-        assert_ne!(id_a, id_b);
-        assert_ne!(id_b, id_c);
+        NestedRtcpRelayFixture {
+            rtcp_a,
+            _rtcp_b: rtcp_b,
+            _rtcp_c: rtcp_c,
+            id_a,
+            id_b,
+            id_c,
+            nested_url,
+            tunnel,
+            reverse_tunnel: Box::new(reverse_tunnel),
+            bootstrap_create_count,
+        }
+    }
+
+    async fn open_echo_stream(
+        tunnel: &dyn TunnelBox,
+        stream_id: &str,
+        payload: &[u8],
+        context: &str,
+    ) -> Box<dyn AsyncStream> {
+        open_echo_stream_with_open_retries(tunnel, stream_id, payload, context, 1).await
+    }
+
+    async fn open_echo_stream_with_open_retries(
+        tunnel: &dyn TunnelBox,
+        stream_id: &str,
+        payload: &[u8],
+        context: &str,
+        open_attempts: usize,
+    ) -> Box<dyn AsyncStream> {
+        let stream =
+            open_stream_with_quota_retries(tunnel, stream_id, context, open_attempts).await;
+        echo_stream(stream, payload, context).await
+    }
+
+    async fn echo_stream(
+        mut stream: Box<dyn AsyncStream>,
+        payload: &[u8],
+        context: &str,
+    ) -> Box<dyn AsyncStream> {
+        match tokio::time::timeout(Duration::from_secs(60), stream.write_all(payload)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("{} stream write failed: {}", context, e),
+            Err(_) => panic!("{} stream write timed out", context),
+        }
+
+        let mut buf = vec![0u8; payload.len()];
+        match tokio::time::timeout(Duration::from_secs(60), stream.read_exact(&mut buf)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => panic!("{} stream read failed: {}", context, e),
+            Err(_) => panic!("{} stream read timed out", context),
+        }
+        assert_eq!(buf, payload, "{} stream echo payload mismatch", context);
+
+        stream
+    }
+
+    async fn open_stream_with_quota_retries(
+        tunnel: &dyn TunnelBox,
+        stream_id: &str,
+        context: &str,
+        open_attempts: usize,
+    ) -> Box<dyn AsyncStream> {
+        let open_attempts = open_attempts.max(1);
+        for attempt in 1..=open_attempts {
+            match tokio::time::timeout(Duration::from_secs(30), tunnel.open_stream(stream_id)).await
+            {
+                Ok(Ok(stream)) => return stream,
+                Ok(Err(e)) => {
+                    let error_message = e.to_string();
+                    let is_transient_rejection =
+                        error_message.contains("result=1") || error_message.contains("result=2");
+                    if is_transient_rejection && attempt < open_attempts {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                    panic!("{} stream open failed: {}", context, e);
+                }
+                Err(_) => panic!("{} stream open timed out", context),
+            }
+        }
+        unreachable!("open_attempts is clamped to at least one");
+    }
+
+    async fn assert_concurrent_stream_opens(
+        tunnel: Box<dyn TunnelBox>,
+        stream_id_prefix: &'static str,
+        count: usize,
+    ) {
+        let mut streams = FuturesUnordered::new();
+        for i in 0..count {
+            let tunnel = tunnel.clone();
+            streams.push(async move {
+                let stream_id = format!("{}{}.test:80", stream_id_prefix, i);
+                let stream = open_stream_with_quota_retries(
+                    tunnel.as_ref(),
+                    &stream_id,
+                    stream_id_prefix,
+                    500,
+                )
+                .await;
+                drop(stream);
+            });
+        }
+
+        let mut completed = 0usize;
+        while streams.next().await.is_some() {
+            completed += 1;
+        }
+        assert_eq!(completed, count, "{} streams opened", stream_id_prefix);
+    }
+
+    #[tokio::test]
+    async fn test_rtcp_nested_remote_rebinds_transport_via_rtcp_relay() {
+        let fixture = setup_nested_rtcp_relay_fixture("nested-flow").await;
+
+        let nested_status = tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture
+                .rtcp_a
+                .probe_url(&fixture.nested_url, &TunnelProbeOptions::default()),
+        )
+        .await
+        .expect("nested remote probe timed out")
+        .expect("nested remote probe failed");
+        assert_eq!(
+            nested_status.state,
+            crate::tunnel_url_status::TunnelUrlState::Reachable
+        );
+        assert_eq!(
+            nested_status.source,
+            crate::tunnel_url_status::TunnelUrlStatusSource::ExistingTunnel
+        );
+        assert!(
+            nested_status
+                .runtime_tunnel_key
+                .as_deref()
+                .unwrap_or_default()
+                .contains("|bootstrap=rtcp://"),
+            "nested probe must report a bootstrap-qualified tunnel key: {:?}",
+            nested_status.runtime_tunnel_key
+        );
+
+        let before_business_stream = fixture.bootstrap_create_count.load(Ordering::SeqCst);
+        let stream = open_echo_stream(
+            fixture.tunnel.as_ref(),
+            "test:80",
+            b"test",
+            "nested remote forward",
+        )
+        .await;
+        assert!(
+            fixture.bootstrap_create_count.load(Ordering::SeqCst) > before_business_stream,
+            "nested business stream open must replay the bootstrap transport"
+        );
+
+        let before_reverse_stream = fixture.bootstrap_create_count.load(Ordering::SeqCst);
+        let reverse_stream = open_echo_stream(
+            fixture.reverse_tunnel.as_ref(),
+            "reverse.test:80",
+            b"back",
+            "nested remote reverse",
+        )
+        .await;
+        assert!(
+            fixture.bootstrap_create_count.load(Ordering::SeqCst) > before_reverse_stream,
+            "B-side reverse open should make A replay the bootstrap transport"
+        );
+        drop(stream);
+
+        let control_status_while_reverse_stream_open = tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture
+                .rtcp_a
+                .probe_url(&fixture.nested_url, &TunnelProbeOptions::default()),
+        )
+        .await
+        .expect("nested remote control probe timed out while reverse stream is open")
+        .expect("nested remote control probe failed while reverse stream is open");
+        assert_eq!(
+            control_status_while_reverse_stream_open.state,
+            crate::tunnel_url_status::TunnelUrlState::Reachable
+        );
+        assert_eq!(
+            control_status_while_reverse_stream_open.source,
+            crate::tunnel_url_status::TunnelUrlStatusSource::ExistingTunnel
+        );
+        drop(reverse_stream);
+
+        assert_ne!(fixture.id_a, fixture.id_b);
+        assert_ne!(fixture.id_b, fixture.id_c);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn test_rtcp_nested_remote_concurrent_streams_via_rtcp_relay() {
+        let fixture = setup_nested_rtcp_relay_fixture("nested-concurrent").await;
+        let concurrent_stream_count = 1000usize;
+
+        let before_concurrent_streams = fixture.bootstrap_create_count.load(Ordering::SeqCst);
+        tokio::join!(
+            assert_concurrent_stream_opens(
+                fixture.tunnel.clone(),
+                "forward",
+                concurrent_stream_count,
+            ),
+            assert_concurrent_stream_opens(
+                fixture.reverse_tunnel.clone(),
+                "reverse",
+                concurrent_stream_count,
+            ),
+        );
+        assert!(
+            fixture.bootstrap_create_count.load(Ordering::SeqCst)
+                >= before_concurrent_streams + (concurrent_stream_count * 2),
+            "each concurrent forward and reverse stream should replay the bootstrap transport"
+        );
+
+        let _forward_after_stress = open_echo_stream(
+            fixture.tunnel.as_ref(),
+            "forward-after-stress.test:80",
+            b"forward-after-stress",
+            "forward after concurrent open stress",
+        )
+        .await;
+
+        let _reverse_after_stress = open_echo_stream(
+            fixture.reverse_tunnel.as_ref(),
+            "reverse-after-stress.test:80",
+            b"reverse-after-stress",
+            "reverse after concurrent open stress",
+        )
+        .await;
     }
 
     #[tokio::test(flavor = "local")]
     async fn test_rtcp_datagram() {
-        let _ = init_name_lib_for_test(&HashMap::new()).await.unwrap();
+        let _ = init_name_lib_for_test(&HashMap::new()).await;
         let (port1, port2) = available_tcp_port_pair();
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceConfig::new_by_jwk("test1", serde_json::from_value(jwk).unwrap());
         let id1 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);
@@ -4340,7 +5406,8 @@ mod tests {
 
         let (signing_key, pkcs8_bytes) = generate_ed25519_key();
         let jwk = encode_ed25519_sk_to_pk_jwk(&signing_key);
-        let device_config = DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
+        let device_config =
+            DeviceConfig::new_by_jwk("test2", serde_json::from_value(jwk).unwrap());
         let id2 = device_config.id.clone();
         let did_doc_value = serde_json::to_value(&device_config).unwrap();
         let encoded_doc = EncodedDocument::JsonLd(did_doc_value);

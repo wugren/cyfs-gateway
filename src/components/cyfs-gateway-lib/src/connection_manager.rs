@@ -10,6 +10,12 @@ use tokio::task::{AbortHandle, JoinHandle};
 pub type SpeedStatRef = Arc<dyn SpeedStat>;
 pub type SpeedTrackerRef = Arc<dyn SpeedTracker>;
 
+pub trait StatFactory: Send + Sync {
+    fn create_speed_stat(&self, id: &str) -> Option<SpeedTrackerRef>;
+}
+
+pub type StatFactoryRef = Arc<dyn StatFactory>;
+
 pub struct NoSpeedStat {
     write_stat: AtomicU64,
     read_stat: AtomicU64,
@@ -54,8 +60,17 @@ impl sfo_io::SpeedTracker for NoSpeedStat {
     }
 }
 
+pub struct NoSpeedStatFactory;
+
+impl StatFactory for NoSpeedStatFactory {
+    fn create_speed_stat(&self, _id: &str) -> Option<SpeedTrackerRef> {
+        Some(Arc::new(NoSpeedStat::new()))
+    }
+}
+
 pub struct StatManager {
     speed_stats: RwLock<HashMap<String, SpeedTrackerRef>>,
+    stat_factory: Option<StatFactoryRef>,
 }
 pub type StatManagerRef = Arc<StatManager>;
 
@@ -63,6 +78,14 @@ impl StatManager {
     pub fn new() -> StatManagerRef {
         Arc::new(Self {
             speed_stats: RwLock::new(HashMap::new()),
+            stat_factory: None,
+        })
+    }
+
+    pub fn with_stat_factory(stat_factory: StatFactoryRef) -> StatManagerRef {
+        Arc::new(Self {
+            speed_stats: RwLock::new(HashMap::new()),
+            stat_factory: Some(stat_factory),
         })
     }
 
@@ -70,13 +93,28 @@ impl StatManager {
         self.speed_stats.read().unwrap().get(id).cloned()
     }
 
+    pub fn list_speed_stat_ids(&self) -> Vec<String> {
+        self.speed_stats.read().unwrap().keys().cloned().collect()
+    }
+
+    pub fn remove_speed_stat(&self, id: &str) -> Option<SpeedTrackerRef> {
+        self.speed_stats.write().unwrap().remove(id)
+    }
+
     fn get_or_create_speed_stat(&self, id: &str) -> SpeedTrackerRef {
         if let Some(stat_ref) = self.get_speed_stat(id) {
             stat_ref
         } else {
-            let stat = Arc::new(NoSpeedStat::new());
-            self.new_speed_stat(id, stat.clone());
-            stat
+            let stat = self
+                .stat_factory
+                .as_ref()
+                .and_then(|factory| factory.create_speed_stat(id))
+                .unwrap_or_else(|| Arc::new(NoSpeedStat::new()));
+            let mut speed_stats = self.speed_stats.write().unwrap();
+            speed_stats
+                .entry(id.to_string())
+                .or_insert_with(|| stat)
+                .clone()
         }
     }
 
@@ -498,6 +536,187 @@ mod tests {
         fn get_read_sum_size(&self) -> u64 {
             0
         }
+    }
+
+    struct RecordingSpeedTracker {
+        write_size: AtomicU64,
+        read_size: AtomicU64,
+    }
+
+    impl RecordingSpeedTracker {
+        fn new() -> Self {
+            Self {
+                write_size: AtomicU64::new(0),
+                read_size: AtomicU64::new(0),
+            }
+        }
+
+        fn write_size(&self) -> u64 {
+            self.write_size.load(Ordering::Relaxed)
+        }
+
+        fn read_size(&self) -> u64 {
+            self.read_size.load(Ordering::Relaxed)
+        }
+    }
+
+    impl SpeedStat for RecordingSpeedTracker {
+        fn get_write_speed(&self) -> u64 {
+            0
+        }
+
+        fn get_write_sum_size(&self) -> u64 {
+            self.write_size()
+        }
+
+        fn get_read_speed(&self) -> u64 {
+            0
+        }
+
+        fn get_read_sum_size(&self) -> u64 {
+            self.read_size()
+        }
+    }
+
+    impl SpeedTracker for RecordingSpeedTracker {
+        fn add_write_data_size(&self, size: u64) {
+            self.write_size.fetch_add(size, Ordering::Relaxed);
+        }
+
+        fn add_read_data_size(&self, size: u64) {
+            self.read_size.fetch_add(size, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingStatFactory {
+        created: Mutex<Vec<(String, Arc<RecordingSpeedTracker>)>>,
+    }
+
+    impl RecordingStatFactory {
+        fn created_ids(&self) -> Vec<String> {
+            self.created
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(id, _)| id.clone())
+                .collect()
+        }
+
+        fn created_stat(&self, index: usize) -> Arc<RecordingSpeedTracker> {
+            self.created.lock().unwrap()[index].1.clone()
+        }
+    }
+
+    impl StatFactory for RecordingStatFactory {
+        fn create_speed_stat(&self, id: &str) -> Option<SpeedTrackerRef> {
+            let stat = Arc::new(RecordingSpeedTracker::new());
+            self.created
+                .lock()
+                .unwrap()
+                .push((id.to_string(), stat.clone()));
+            Some(stat)
+        }
+    }
+
+    #[derive(Default)]
+    struct EmptyStatFactory {
+        called: AtomicU64,
+    }
+
+    impl StatFactory for EmptyStatFactory {
+        fn create_speed_stat(&self, _id: &str) -> Option<SpeedTrackerRef> {
+            self.called.fetch_add(1, Ordering::Relaxed);
+            None
+        }
+    }
+
+    #[test]
+    fn test_stat_manager_uses_configured_factory_for_default_stats() {
+        let factory = Arc::new(RecordingStatFactory::default());
+        let manager = StatManager::with_stat_factory(factory.clone());
+
+        let stats = manager.get_speed_stats(&[String::from("custom")]);
+        assert_eq!(factory.created_ids(), vec![String::from("custom")]);
+
+        stats[0].add_write_data_size(7);
+        stats[0].add_read_data_size(11);
+
+        let created = factory.created_stat(0);
+        assert_eq!(created.write_size(), 7);
+        assert_eq!(created.read_size(), 11);
+    }
+
+    #[test]
+    fn test_stat_manager_keeps_existing_stats_from_configured_factory() {
+        let factory = Arc::new(RecordingStatFactory::default());
+        let manager = StatManager::with_stat_factory(factory.clone());
+
+        let first = manager.get_speed_stats(&[String::from("shared")]);
+        let second = manager.get_speed_stats(&[String::from("shared"), String::from("new")]);
+
+        assert!(Arc::ptr_eq(&first[0], &second[0]));
+        assert_eq!(
+            factory.created_ids(),
+            vec![String::from("shared"), String::from("new")]
+        );
+    }
+
+    #[test]
+    fn test_stat_manager_remove_speed_stat() {
+        let factory = Arc::new(RecordingStatFactory::default());
+        let manager = StatManager::with_stat_factory(factory.clone());
+
+        let stats = manager.get_speed_stats(&[String::from("first"), String::from("second")]);
+        let removed = manager.remove_speed_stat("first").unwrap();
+
+        assert!(Arc::ptr_eq(&stats[0], &removed));
+        assert!(manager.get_speed_stat("first").is_none());
+        assert!(manager.get_speed_stat("second").is_some());
+        assert_eq!(manager.list_speed_stat_ids(), vec![String::from("second")]);
+        assert!(manager.remove_speed_stat("missing").is_none());
+    }
+
+    #[test]
+    fn test_stat_manager_recreates_removed_speed_stat() {
+        let factory = Arc::new(RecordingStatFactory::default());
+        let manager = StatManager::with_stat_factory(factory.clone());
+
+        let first = manager.get_speed_stats(&[String::from("recreated")]);
+        manager.remove_speed_stat("recreated").unwrap();
+        let second = manager.get_speed_stats(&[String::from("recreated")]);
+
+        assert!(!Arc::ptr_eq(&first[0], &second[0]));
+        assert_eq!(
+            factory.created_ids(),
+            vec![String::from("recreated"), String::from("recreated")]
+        );
+    }
+
+    #[test]
+    fn test_stat_manager_falls_back_when_factory_returns_none() {
+        let factory = Arc::new(EmptyStatFactory::default());
+        let manager = StatManager::with_stat_factory(factory.clone());
+
+        let stats = manager.get_speed_stats(&[String::from("fallback")]);
+        stats[0].add_write_data_size(3);
+        stats[0].add_read_data_size(5);
+
+        assert_eq!(factory.called.load(Ordering::Relaxed), 1);
+        assert_eq!(stats[0].get_write_sum_size(), 3);
+        assert_eq!(stats[0].get_read_sum_size(), 5);
+    }
+
+    #[test]
+    fn test_stat_manager_falls_back_without_factory() {
+        let manager = StatManager::new();
+
+        let stats = manager.get_speed_stats(&[String::from("default")]);
+        stats[0].add_write_data_size(13);
+        stats[0].add_read_data_size(17);
+
+        assert_eq!(stats[0].get_write_sum_size(), 13);
+        assert_eq!(stats[0].get_read_sum_size(), 17);
     }
 
     #[tokio::test]

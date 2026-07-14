@@ -1,0 +1,95 @@
+# web3_sn_api.yaml —— web3_gateway.yaml 的 SN API 拆分：sn./bns./web3. 的
+# HTTPS/HTTP 服务（SN RPC、DID resolver、BNS 网关），不做设备流量转发。
+# 独立部署三件套之一（web3_dns / web3_relay / web3_sn_api）；单机合并部署
+# 请继续使用 web3_gateway.yaml。
+#
+# - 对外 443/80 由 web3_relay 承接，按 SNI/Host 原样转到本实例的
+#   {{api_tls_bind}} / {{api_http_bind}}（api_tls_port / api_http_port
+#   必须与对应 bind 的端口一致，与 tls_bind/tls_port 同款约束）。
+# - C 类种子（sn_seed.yaml）只在本实例幂等导入；跨机部署改用
+#   db: {type: postgres, provider_base_url: ...} 时不支持 seed_path，
+#   需删除该行并在 provider 侧导入种子。
+# - website.yaml 是 https://sn.{{sn_host}} 常规网页的扩展位，与合并配置
+#   一致，由运维手工维护。
+includes:
+  - path: params.json
+  - path: website.yaml
+
+servers:
+  web3_sn:
+    id: web3_sn
+    type: sn
+    host: "{{sn_host}}"
+    boot_jwt: "{{sn_boot_jwt}}"
+    owner_pkx: "{{sn_owner_pk}}"
+    device_jwt: ["{{sn_device_jwt}}"]
+    ip: "{{sn_ip}}"
+    # SN 强依赖统一 BNS RPC；裸 host 会规范化为 /kapi/bns。
+    bns_rpc_url: "{{bns_rpc_url}}"
+    # 生产环境通过 secret 注入 controller key；缺失时 SN 初始化失败。
+    # dev-local/dev-vm profile 会替换为各自的受限 controller 列表。
+    bns_evm:
+      controller_private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY
+    bns_proxy:
+      require_user_asset_owner: true
+    # C 类种子(激活码/sn_user 账号/user_domain 绑定)幂等导入;相对路径按
+    # 配置目录解析,文件不存在时自动跳过(部署目录没有种子也能正常启动)。
+    seed_path: "sn_seed.yaml"
+
+  main_http:
+    type: http
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              eq ${REQ.host} "bns.{{sn_host}}" && return "forward {{bns_server_url}}";
+              eq ${REQ.host} "sn.{{sn_host}}" && match ${REQ.path} "/1.0/identifiers/*" && return "server web3_sn";
+              eq ${REQ.host} "sn.{{sn_host}}" && return "server web3_sn";
+              eq ${REQ.host} "web3.{{sn_host}}" && return "server web3_sn";
+              return "error 404 unknown_host_${REQ.host}";
+
+stacks:
+  main_http_tcp:
+    bind: "{{api_http_bind}}"
+    protocol: tcp
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              return "server main_http";
+
+  # *.web3 设备域名的泛域证书与 TLS 终止在 web3_relay 实例；这里只终止
+  # API 域名。www/apex 的证书可由 website.yaml 按需扩展 hosts。
+  main_tls:
+    bind: "{{api_tls_bind}}"
+    protocol: tls
+    hosts:
+      - host: "sn.{{sn_host}}"
+        cert_path: "{{sn_cer}}"
+        key_path: "{{sn_pem}}"
+      - host: "bns.{{sn_host}}"
+        cert_path: "{{sn_cer}}"
+        key_path: "{{sn_pem}}"
+      - host: "web3.{{sn_host}}"
+        cert_path: "{{web3_cer}}"
+        key_path: "{{web3_pem}}"
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              return "server main_http";

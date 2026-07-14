@@ -9,6 +9,10 @@
 # user_name: "root"    # 控制台登录用户名，可选
 # password: "123456"   # 控制台登录密码，可选（明文，会在登录时做哈希）
 
+# identity_manager:    # Gateway 级 identity store；ACME、TLS、QUIC、RTCP 默认共用这里
+#   public_root_path: ./identity
+#   security_root_path: ./security
+
 # acme:               # ACME 证书配置（可选）
 #   account: "admin@example.com"  # ACME 账户
 #   issuer: "https://acme-v02.api.letsencrypt.org/directory"  # ACME 服务地址
@@ -27,9 +31,7 @@
 #     - host: "*.example.org"
 #       challenge_type: dns-01
 #       dns_provider: sn-dns
-#   identity_manager:  # 可选；证书安装到该 identity store，TLS/QUIC stack 再从这里加载
-#     public_root_path: ./identity
-#     security_root_path: ./security
+#   # identity_manager 可选；默认继承 Gateway 级 identity_manager
 #   check_interval: 43200          # 证书检查周期（秒），默认 12h
 #   renew_before_expiry: 604800    # 提前续期时间（秒），默认 7d
 
@@ -133,6 +135,7 @@ stacks:
   #   hosts: # QUIC 只声明可响应的证书身份；证书由 acme.hosts 或 identity store 提供
   #     - example.com
   #     - "*.example.org"
+  #   # identity_manager 可选；仅在该 stack 要覆盖 Gateway 级配置时使用
   #   certs:
   #     - domain: * #本地缺省证书，所有通过该stack的连接都会使用本地根证书生成对应的证书，根证书可以通过tls_ca字段配置
   #   hook_point: { }
@@ -140,9 +143,12 @@ stacks:
   # rtcp_example:
   #   protocol: rtcp
   #   bind: 0.0.0.0:2980
-  #   key_path: ./sn_private_key.pem
-  #   device_config_path: ./device.doc.jwt  # 也支持 JSON；只有配置 JWT 时，Hello 才会自动携带 device_doc_jwt
-  #   name: optional_name
+  #   identity: did:web:device.example.com # 推荐；从 Gateway 级 identity_manager 加载本地身份
+  #   # legacy explicit identity config is still supported:
+  #   # key_path: ./sn_private_key.pem
+  #   # device_config_path: ./device.doc.jwt  # did:dev 可用 JSON；逻辑 DID 必须配置 JWT，Hello 会携带 device_doc_jwt
+  #   # device_doc_jwt: <owner-signed-device-doc-jwt> # 可内联填写，替代 device_config_path/device.doc.jwt
+  #   # name: optional_name
   #   stream_idle_timeout: 60     # stream 转发空闲超时（秒），默认 60
   #   hook_point: { }
 
@@ -162,6 +168,9 @@ servers:
     type: http
     # version: "HTTP/1.1"         # 可选：HTTP/1.1、HTTP/2、HTTP/3，默认 HTTP/1.1
     # h3_port: 443                # 可选：HTTP/3 端口
+    # trusted_upstreams:          # 可选：可信上一跳 IP/CIDR 列表。仅当直接上一跳命中时，
+    #   - 127.0.0.1               # 其 X-Forwarded-For / X-Real-IP 才会被还原为
+    #   - 10.0.0.0/8              # real_source_*（默认不信任任何转发头）
     hook_point:
       main:
         priority: 1

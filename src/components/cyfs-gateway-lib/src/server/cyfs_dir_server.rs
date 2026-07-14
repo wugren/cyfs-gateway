@@ -61,7 +61,7 @@ use crate::{
     GlobalCollectionManagerRef, HttpRequestHeaderMap, JsExternalsManagerRef, ProcessChainConfigs,
     HttpServer, Server, ServerConfig, ServerContext, ServerContextRef, ServerError,
     ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo,
-    get_external_commands, into_server_err, server_err,
+    RequestSourceInfo, get_external_commands, into_server_err, server_err,
 };
 
 const ENV_KEY_CYOBJ_META: &str = "RESP_cyobj_meta";
@@ -222,6 +222,7 @@ impl CyfsDirServer {
     async fn run_chain(
         &self,
         req: Request<UnsyncBoxBody<Bytes, ServerError>>,
+        info: &StreamInfo,
     ) -> ServerResult<ChainOutcome> {
         let executor = match self.executor.as_ref() {
             Some(e) => e,
@@ -234,7 +235,8 @@ impl CyfsDirServer {
         // the chain runs.
         let global_env = executor.global_env().clone();
 
-        let req_map = HttpRequestHeaderMap::new(req);
+        let req_map =
+            HttpRequestHeaderMap::new_with_sources(req, RequestSourceInfo::from_stream_info(info));
         req_map
             .register_visitors(&global_env)
             .await
@@ -251,7 +253,9 @@ impl CyfsDirServer {
                 return Ok(ChainOutcome::Response(empty_response(StatusCode::OK)));
             }
             if ret.is_reject() {
-                return Ok(ChainOutcome::Response(empty_response(StatusCode::FORBIDDEN)));
+                return Ok(ChainOutcome::Response(empty_response(
+                    StatusCode::FORBIDDEN,
+                )));
             }
             if let Some(CommandControl::Error(e)) = ret.as_control() {
                 let msg = e.value.to_string();
@@ -321,11 +325,19 @@ impl CyfsDirServer {
                 );
             }
 
-            return Ok(ChainOutcome::Resolved(rewrite_to_o_link(req, &record.obj_id, &self.url_prefix)));
+            return Ok(ChainOutcome::Resolved(rewrite_to_o_link(
+                req,
+                &record.obj_id,
+                &self.url_prefix,
+            )));
         }
 
         if let Some(CollectionValue::String(obj_id)) = id_value {
-            return Ok(ChainOutcome::Resolved(rewrite_to_o_link(req, &obj_id, &self.url_prefix)));
+            return Ok(ChainOutcome::Resolved(rewrite_to_o_link(
+                req,
+                &obj_id,
+                &self.url_prefix,
+            )));
         }
 
         Ok(ChainOutcome::PassThrough(req))
@@ -339,7 +351,7 @@ impl HttpServer for CyfsDirServer {
         req: Request<UnsyncBoxBody<Bytes, ServerError>>,
         info: StreamInfo,
     ) -> Result<Response<UnsyncBoxBody<Bytes, ServerError>>, ServerError> {
-        let req = match self.run_chain(req).await {
+        let req = match self.run_chain(req, &info).await {
             Ok(ChainOutcome::Response(resp)) => return Ok(resp),
             Ok(ChainOutcome::Resolved(req)) | Ok(ChainOutcome::PassThrough(req)) => req,
             Err(e) => {
@@ -556,9 +568,7 @@ impl ServerFactory for CyfsDirServerFactory {
         let mut inner_cfg = NdnDirServerConfig::new(semantic_root, store_mgr.clone(), mode)
             .url_prefix(cfg.url_prefix.clone())
             .obj_id_in_host(cfg.obj_id_in_host)
-            .scan_interval(Duration::from_secs(
-                cfg.scan_interval_secs.max(1),
-            ));
+            .scan_interval(Duration::from_secs(cfg.scan_interval_secs.max(1)));
         if let Some(key) = signing_key {
             inner_cfg = inner_cfg.signing_key(key, signing_kid);
         }

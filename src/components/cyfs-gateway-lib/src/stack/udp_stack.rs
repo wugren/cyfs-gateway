@@ -11,7 +11,7 @@ use crate::{
     ServerManagerRef, SpeedStatRef, Stack, StackConfig, StackContext, StackError, StackErrorCode,
     StackFactory, StackProtocol, StackRef, StackResult, StatManagerRef, TunnelManager,
     create_io_dump_stack_config, dump_single_datagram, get_external_commands, get_stat_info,
-    into_stack_err, stack_err,
+    insert_req_source_addr_group, into_stack_err, stack_err,
 };
 use cyfs_process_chain::{
     CollectionValue, CommandControl, MemoryMapCollection, ProcessChainLibExecutor,
@@ -193,6 +193,7 @@ impl UdpDatagramHandler {
                 e
             )
         })?;
+        insert_req_source_addr_group(&map, "conn_source_", src_addr).await?;
 
         if let Some(device_info) = state
             .connection_manager

@@ -11,8 +11,9 @@ use crate::stack::tls_cert_resolver::{
 };
 use crate::stack::tls_stack::build_identity_cert_config;
 use crate::stack::{
-    TlsCertResolver, connect_timeout_from_secs, get_limit_info, probe_proxy_protocol_stream,
-    stream_forward, stream_forward_group, stream_idle_timeout_from_secs,
+    TlsCertResolver, connect_timeout_from_secs, get_limit_info, insert_req_source_addr_group,
+    probe_proxy_protocol_stream, stream_forward, stream_forward_group,
+    stream_idle_timeout_from_secs,
 };
 use crate::{
     ComposedSpeedStat, ConnectionController, ConnectionInfo, ConnectionManagerRef, DumpStream,
@@ -498,6 +499,7 @@ impl QuicConnectionHandler {
         )
         .await
         .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;
+        insert_req_source_addr_group(&map, "conn_source_", remote_addr).await?;
         map.insert("dest_addr", CollectionValue::String(local_addr.to_string()))
             .await
             .map_err(|e| stack_err!(StackErrorCode::ProcessChainError, "{e}"))?;

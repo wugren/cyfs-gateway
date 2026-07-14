@@ -223,6 +223,38 @@ impl MapCollection for StreamRequestMap {
                     return Err(msg);
                 }
             }
+            "conn_source_addr" => {
+                prev = request
+                    .conn_source_addr
+                    .map(|addr| CollectionValue::String(addr.to_string()));
+                if let CollectionValue::String(addr) = value {
+                    request.conn_source_addr = Some(addr.parse().map_err(|e| {
+                        let msg = format!("Failed to parse conn_source_addr: {}, {}", addr, e);
+                        error!("{}", msg);
+                        msg
+                    })?);
+                } else {
+                    let msg = format!("conn_source_addr must be a string, got {:?}", value);
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
+            "real_source_addr" => {
+                prev = request
+                    .real_source_addr
+                    .map(|addr| CollectionValue::String(addr.to_string()));
+                if let CollectionValue::String(addr) = value {
+                    request.real_source_addr = Some(addr.parse().map_err(|e| {
+                        let msg = format!("Failed to parse real_source_addr: {}, {}", addr, e);
+                        error!("{}", msg);
+                        msg
+                    })?);
+                } else {
+                    let msg = format!("real_source_addr must be a string, got {:?}", value);
+                    error!("{}", msg);
+                    return Err(msg);
+                }
+            }
             "source_mac" => {
                 prev = request.source_mac.clone().map(CollectionValue::String);
                 if let CollectionValue::String(mac) = value {
@@ -347,6 +379,24 @@ impl MapCollection for StreamRequestMap {
             "source_port" => Ok(request
                 .source_addr
                 .map(|addr| CollectionValue::String(addr.port().to_string()))),
+            "conn_source_addr" => Ok(request
+                .conn_source_addr
+                .map(|addr| CollectionValue::String(addr.to_string()))),
+            "conn_source_ip" => Ok(request
+                .conn_source_addr
+                .map(|addr| CollectionValue::String(addr.ip().to_string()))),
+            "conn_source_port" => Ok(request
+                .conn_source_addr
+                .map(|addr| CollectionValue::String(addr.port().to_string()))),
+            "real_source_addr" => Ok(request
+                .real_source_addr
+                .map(|addr| CollectionValue::String(addr.to_string()))),
+            "real_source_ip" => Ok(request
+                .real_source_addr
+                .map(|addr| CollectionValue::String(addr.ip().to_string()))),
+            "real_source_port" => Ok(request
+                .real_source_addr
+                .map(|addr| CollectionValue::String(addr.port().to_string()))),
             "source_mac" => Ok(request.source_mac.clone().map(CollectionValue::String)),
             "source_hostname" => Ok(request.source_hostname.clone().map(CollectionValue::String)),
             "source_device_id" => Ok(request
@@ -384,6 +434,12 @@ impl MapCollection for StreamRequestMap {
             "source_addr" => Ok(request.source_addr.is_some()),
             "source_ip" => Ok(request.source_addr.is_some()),
             "source_port" => Ok(request.source_addr.is_some()),
+            "conn_source_addr" => Ok(request.conn_source_addr.is_some()),
+            "conn_source_ip" => Ok(request.conn_source_addr.is_some()),
+            "conn_source_port" => Ok(request.conn_source_addr.is_some()),
+            "real_source_addr" => Ok(request.real_source_addr.is_some()),
+            "real_source_ip" => Ok(request.real_source_addr.is_some()),
+            "real_source_port" => Ok(request.real_source_addr.is_some()),
             "source_mac" => Ok(request.source_mac.is_some()),
             "source_hostname" => Ok(request.source_hostname.is_some()),
             "source_device_id" => Ok(request.source_device_id.is_some()),
@@ -421,6 +477,14 @@ impl MapCollection for StreamRequestMap {
             "dest_url" => Ok(request.dest_url.take().map(CollectionValue::String)),
             "source_addr" => Ok(request
                 .source_addr
+                .take()
+                .map(|addr| CollectionValue::String(addr.to_string()))),
+            "conn_source_addr" => Ok(request
+                .conn_source_addr
+                .take()
+                .map(|addr| CollectionValue::String(addr.to_string()))),
+            "real_source_addr" => Ok(request
+                .real_source_addr
                 .take()
                 .map(|addr| CollectionValue::String(addr.to_string()))),
             "source_mac" => Ok(request.source_mac.take().map(CollectionValue::String)),
@@ -485,6 +549,48 @@ impl MapCollection for StreamRequestMap {
                 "source_port",
                 request
                     .source_addr
+                    .map(|addr| addr.port().to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "conn_source_addr",
+                request
+                    .conn_source_addr
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "conn_source_ip",
+                request
+                    .conn_source_addr
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "conn_source_port",
+                request
+                    .conn_source_addr
+                    .map(|addr| addr.port().to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "real_source_addr",
+                request
+                    .real_source_addr
+                    .map(|addr| addr.to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "real_source_ip",
+                request
+                    .real_source_addr
+                    .map(|addr| addr.ip().to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "real_source_port",
+                request
+                    .real_source_addr
                     .map(|addr| addr.port().to_string())
                     .unwrap_or_default(),
             ),
@@ -561,6 +667,34 @@ impl MapCollection for StreamRequestMap {
             ));
             result.push((
                 "source_port".to_string(),
+                CollectionValue::String(addr.port().to_string()),
+            ));
+        }
+        if let Some(addr) = &request.conn_source_addr {
+            result.push((
+                "conn_source_addr".to_string(),
+                CollectionValue::String(addr.to_string()),
+            ));
+            result.push((
+                "conn_source_ip".to_string(),
+                CollectionValue::String(addr.ip().to_string()),
+            ));
+            result.push((
+                "conn_source_port".to_string(),
+                CollectionValue::String(addr.port().to_string()),
+            ));
+        }
+        if let Some(addr) = &request.real_source_addr {
+            result.push((
+                "real_source_addr".to_string(),
+                CollectionValue::String(addr.to_string()),
+            ));
+            result.push((
+                "real_source_ip".to_string(),
+                CollectionValue::String(addr.ip().to_string()),
+            ));
+            result.push((
+                "real_source_port".to_string(),
                 CollectionValue::String(addr.port().to_string()),
             ));
         }
@@ -708,4 +842,94 @@ pub async fn execute_chain(
         .await
         .map_err(|e| config_err!(ConfigErrorCode::ProcessChainError, "{}", e))?;
     Ok(ret)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_stream_request_map_source_layer_keys() {
+        let mut request = StreamRequest::default();
+        request.source_addr = Some("198.51.100.7:6001".parse().unwrap());
+        request.conn_source_addr = Some("127.0.0.1:9000".parse().unwrap());
+        request.real_source_addr = Some("198.51.100.7:6001".parse().unwrap());
+        let map = StreamRequestMap::new(request);
+
+        let get = |key: &'static str| {
+            let map = map.clone();
+            async move {
+                map.get(key)
+                    .await
+                    .unwrap()
+                    .map(|v| v.try_as_str().unwrap().to_string())
+            }
+        };
+
+        assert_eq!(get("source_ip").await.as_deref(), Some("198.51.100.7"));
+        assert_eq!(
+            get("conn_source_addr").await.as_deref(),
+            Some("127.0.0.1:9000")
+        );
+        assert_eq!(get("conn_source_ip").await.as_deref(), Some("127.0.0.1"));
+        assert_eq!(get("conn_source_port").await.as_deref(), Some("9000"));
+        assert_eq!(
+            get("real_source_addr").await.as_deref(),
+            Some("198.51.100.7:6001")
+        );
+        assert_eq!(get("real_source_ip").await.as_deref(), Some("198.51.100.7"));
+        assert_eq!(get("real_source_port").await.as_deref(), Some("6001"));
+
+        assert!(map.contains_key("conn_source_ip").await.unwrap());
+        assert!(map.contains_key("real_source_port").await.unwrap());
+
+        // Writable through the *_addr keys, like source_addr.
+        map.insert(
+            "real_source_addr",
+            CollectionValue::String("203.0.113.9:443".to_string()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(get("real_source_ip").await.as_deref(), Some("203.0.113.9"));
+
+        let dumped: std::collections::HashMap<String, String> = map
+            .dump()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, v)| (k, v.try_as_str().unwrap().to_string()))
+            .collect();
+        assert_eq!(
+            dumped.get("conn_source_ip").map(String::as_str),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            dumped.get("real_source_port").map(String::as_str),
+            Some("443")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_request_map_no_fabricated_real_source() {
+        // A direct connection has a conn source but no restored source: the
+        // real_source_* keys must stay absent instead of mirroring conn.
+        let mut request = StreamRequest::default();
+        request.source_addr = Some("192.168.1.9:5555".parse().unwrap());
+        request.conn_source_addr = Some("192.168.1.9:5555".parse().unwrap());
+        let map = StreamRequestMap::new(request);
+
+        assert!(map.get("real_source_addr").await.unwrap().is_none());
+        assert!(map.get("real_source_ip").await.unwrap().is_none());
+        assert!(!map.contains_key("real_source_addr").await.unwrap());
+
+        let dumped: Vec<String> = map
+            .dump()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(dumped.contains(&"conn_source_addr".to_string()));
+        assert!(!dumped.contains(&"real_source_addr".to_string()));
+    }
 }

@@ -1,0 +1,21 @@
+[package]
+name = "bns-evm"
+version.workspace = true
+edition = "2021"
+authors = ["BuckyOS DAO", "@waterflier", "@lurenpluto", "@wugren"]
+
+[dependencies]
+alloy-consensus = { version = "2.1.0", features = ["k256"] }
+alloy-primitives = { version = "1.6.0", features = ["k256", "serde"] }
+alloy-rlp = "0.3.15"
+alloy-signer = "2.1.0"
+alloy-signer-local = "2.1.0"
+alloy-sol-types = { version = "1.6.0", features = ["json"] }
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

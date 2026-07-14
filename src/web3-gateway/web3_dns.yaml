@@ -1,0 +1,64 @@
+# web3_dns.yaml —— web3_gateway.yaml 的 DNS 拆分：只承担 {{dns_bind}} 上的
+# 权威解析。独立部署三件套之一（web3_dns / web3_relay / web3_sn_api）；
+# 单机合并部署请继续使用 web3_gateway.yaml。
+#
+# 数据依赖：resolve 兜底走本进程内的 web3_sn（sn server 只支持进程内
+# qa/resolve，不能远程引用），设备/账号数据默认读 BUCKYOS_ROOT 数据目录的
+# sn.sqlite3 —— 与 api/relay 同机部署时天然共享；跨机部署必须给 web3_sn
+# 增加 db: {type: postgres, provider_base_url: ...} 指向共享 provider。
+# 注意 sn_ip 参数要指向 web3_relay 实例的对外 IP：*.web3 设备域名与
+# sn./bns. 的 A 记录都应落到流量入口。
+includes:
+  - path: params.json
+
+servers:
+  web3_sn:
+    id: web3_sn
+    type: sn
+    host: "{{sn_host}}"
+    boot_jwt: "{{sn_boot_jwt}}"
+    owner_pkx: "{{sn_owner_pk}}"
+    device_jwt: ["{{sn_device_jwt}}"]
+    ip: "{{sn_ip}}"
+    # SN 强依赖统一 BNS RPC；裸 host 会规范化为 /kapi/bns。
+    bns_rpc_url: "{{bns_rpc_url}}"
+    # sn server 硬性要求 controller key（缺失时初始化失败）。DNS 实例不走
+    # 写链，配置它只为满足启动约束；种子导入只由 web3_sn_api 实例负责。
+    bns_evm:
+      controller_private_key_env: BNS_SN_CONTROLLER_PRIVATE_KEY
+    bns_proxy:
+      require_user_asset_owner: true
+
+  local_dns:
+    type: local_dns
+    file_path: local_dns.toml
+
+  main_dns:
+    id: main_dns
+    type: dns
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              call resolve ${REQ.name} ${REQ.record_type} local_dns && return;
+              call resolve ${REQ.name} ${REQ.record_type} web3_sn && return;
+
+stacks:
+  dns_udp:
+    bind: "{{dns_bind}}"
+    protocol: udp
+    hook_point:
+      main:
+        id: main
+        priority: 1
+        blocks:
+          default:
+            id: default
+            priority: 1
+            block: |
+              return "server main_dns";

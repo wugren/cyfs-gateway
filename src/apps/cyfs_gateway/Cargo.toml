@@ -37,12 +37,15 @@ name-lib.workspace = true
 kRPC.workspace = true
 
 cyfs-gateway-lib = { path = "../../components/cyfs-gateway-lib" }
+cyfs-gateway-api.workspace = true
+cyfs-gateway-app-lib = { path = "../../components/cyfs-gateway-app-lib" }
 cyfs-process-chain = { path = "../../components/cyfs-process-chain" }
 cyfs-acme = { path = "../../components/cyfs-acme" }
 cyfs-sn = { path = "../../components/cyfs-sn" }
 cyfs-dns = { path = "../../components/cyfs-dns" }
 cyfs-socks = { path = "../../components/cyfs-socks" }
 cyfs-tun = { path = "../../components/cyfs-tun"}
+cyfs-traffic = { path = "../../components/cyfs-traffic" }
 http-body-util.workspace = true
 http.workspace = true
 shlex.workspace = true
@@ -58,3 +61,7 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 hickory-resolver = { version = "0.24", features = ["tokio"] }
 async-compression = { version = "0.4", features = ["tokio", "gzip", "deflate", "brotli"] }
+bns-indexer = { path = "../../components/bns-indexer" }
+bns-server = { path = "../../components/bns-server" }
+bns-client = { path = "../../components/bns-client" }
+sqlx.workspace = true

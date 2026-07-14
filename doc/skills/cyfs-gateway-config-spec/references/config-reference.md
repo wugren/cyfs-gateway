@@ -248,13 +248,15 @@ hook_point:
 - `on_new_tunnel_hook_point?`
 - `key_path`
 - `device_config_path?`
+- `device_doc_jwt?`
 - `name?`
 - `io_dump_*`
 - `reuse_address?`
 
 约束：
 
-- 未配置 `device_config_path` 时，`name` 必填
+- 未配置 `device_config_path` 和 `device_doc_jwt` 时，`name` 必填
+- 当 stack 的 DID 是逻辑名字（非 `did:dev:<pkx>`）时，必须通过 `device_config_path` 指向 JWT、配置 `device_doc_jwt`，或在 identity manager 中提供 `device.doc.jwt`
 
 ### `tun`
 

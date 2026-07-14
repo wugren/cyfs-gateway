@@ -100,7 +100,7 @@ fn nameinfo_to_rdata(record_type: &str, name_info: &NameInfo) -> Result<Vec<RDat
             for caa in name_info.caa.iter() {
                 let rdata =
                     RData::try_from_str(hickory_server::proto::rr::RecordType::CAA, caa.as_str())
-                    .map_err(|e| anyhow::anyhow!("invalid CAA {}: {}", caa, e))?;
+                        .map_err(|e| anyhow::anyhow!("invalid CAA {}: {}", caa, e))?;
                 records.push(rdata);
             }
             return Ok(records);
@@ -209,9 +209,7 @@ fn is_core_authoritative_record_type(query_type: hickory_server::proto::rr::Reco
 
 fn is_authoritative_loopback_suppressed_error(err: &ServerError) -> bool {
     err.code() == ServerErrorCode::NotFound
-        && err
-            .to_string()
-            .contains(DNS_AUTH_LOOPBACK_SUPPRESSED_MSG)
+        && err.to_string().contains(DNS_AUTH_LOOPBACK_SUPPRESSED_MSG)
 }
 
 /// Trait for handling incoming requests, and providing a message response.
@@ -491,13 +489,8 @@ impl ProcessChainDnsServer {
         let mut header = Header::response_from_request(request.header());
         header.set_response_code(response_code);
         header.set_authoritative(authoritative);
-        let mut message = builder.build(
-            header,
-            answers.iter(),
-            name_servers.iter(),
-            soa.iter(),
-            &[],
-        );
+        let mut message =
+            builder.build(header, answers.iter(), name_servers.iter(), soa.iter(), &[]);
 
         let mut buffer = Vec::with_capacity(512);
         {
@@ -555,31 +548,31 @@ impl ProcessChainDnsServer {
         let is_zone_apex = query_name_str == zone.zone_name_str;
 
         match query_type {
-            hickory_server::proto::rr::RecordType::NS if is_zone_apex => Some(
-                self.authoritative_zone_response_to_buffer(
+            hickory_server::proto::rr::RecordType::NS if is_zone_apex => {
+                Some(self.authoritative_zone_response_to_buffer(
                     request,
                     ResponseCode::NoError,
                     vec![zone_ns_record(&zone)],
                     vec![],
-                ),
-            ),
-            hickory_server::proto::rr::RecordType::SOA if is_zone_apex => Some(
-                self.authoritative_zone_response_to_buffer(
+                ))
+            }
+            hickory_server::proto::rr::RecordType::SOA if is_zone_apex => {
+                Some(self.authoritative_zone_response_to_buffer(
                     request,
                     ResponseCode::NoError,
                     vec![zone_soa_record(&zone)],
                     vec![],
-                ),
-            ),
+                ))
+            }
             hickory_server::proto::rr::RecordType::NS
-            | hickory_server::proto::rr::RecordType::SOA => Some(
-                self.authoritative_zone_response_to_buffer(
+            | hickory_server::proto::rr::RecordType::SOA => {
+                Some(self.authoritative_zone_response_to_buffer(
                     request,
                     ResponseCode::NoError,
                     vec![],
                     vec![zone_soa_record(&zone)],
-                ),
-            ),
+                ))
+            }
             _ => None,
         }
     }
@@ -618,7 +611,6 @@ impl ProcessChainDnsServer {
         if let Some(response) = self.authoritative_web3_zone_response(request, &reqeust_info) {
             return response;
         }
-
 
         // First, check if the record exists in the inner record manager
         if let Some(name_info) = self
@@ -804,12 +796,14 @@ impl ProcessChainDnsServer {
                     Ok(response) => Ok(response),
                     Err(e) => {
                         if let Ok(request_info) = request.request_info() {
-                            if let Some(zone) = detect_web3_zone_authority(request_info.query.name())
+                            if let Some(zone) =
+                                detect_web3_zone_authority(request_info.query.name())
                             {
                                 let query_type = request_info.query.query_type();
                                 let is_zone_apex =
                                     normalize_fqdn(request_info.query.name()) == zone.zone_name_str;
-                                let is_core_zone_type = is_core_authoritative_record_type(query_type);
+                                let is_core_zone_type =
+                                    is_core_authoritative_record_type(query_type);
 
                                 if is_authoritative_loopback_suppressed_error(&e)
                                     && !is_core_zone_type
@@ -839,11 +833,7 @@ impl ProcessChainDnsServer {
                         };
                         warn!(
                             "dns query failed: name={} type={} src={} response_code={:?} err={}",
-                            query_name,
-                            query_type,
-                            addr,
-                            response_code,
-                            e
+                            query_name, query_type, addr, response_code, e
                         );
                         self.response_code_to_buffer(&request, response_code)
                     }
@@ -1184,7 +1174,10 @@ hook_point:
         message.add_query(query);
 
         let data = server
-            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .serve_datagram(
+                message.to_vec().unwrap().as_slice(),
+                DatagramInfo::new(None),
+            )
             .await
             .unwrap();
         let resp = Message::from_vec(data.as_slice()).unwrap();
@@ -1208,7 +1201,10 @@ hook_point:
         message.add_query(query);
 
         let data = server
-            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .serve_datagram(
+                message.to_vec().unwrap().as_slice(),
+                DatagramInfo::new(None),
+            )
             .await
             .unwrap();
         let resp = Message::from_vec(data.as_slice()).unwrap();
@@ -1235,7 +1231,10 @@ hook_point:
         message.add_query(query);
 
         let data = server
-            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .serve_datagram(
+                message.to_vec().unwrap().as_slice(),
+                DatagramInfo::new(None),
+            )
             .await
             .unwrap();
         let resp = Message::from_vec(data.as_slice()).unwrap();
@@ -1256,7 +1255,10 @@ hook_point:
         message.add_query(query);
 
         let data = server
-            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .serve_datagram(
+                message.to_vec().unwrap().as_slice(),
+                DatagramInfo::new(None),
+            )
             .await
             .unwrap();
         let resp = Message::from_vec(data.as_slice()).unwrap();
@@ -1277,7 +1279,10 @@ hook_point:
         message.add_query(query);
 
         let data = server
-            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .serve_datagram(
+                message.to_vec().unwrap().as_slice(),
+                DatagramInfo::new(None),
+            )
             .await
             .unwrap();
         let resp = Message::from_vec(data.as_slice()).unwrap();
@@ -1298,7 +1303,10 @@ hook_point:
         message.add_query(query);
 
         let data = server
-            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .serve_datagram(
+                message.to_vec().unwrap().as_slice(),
+                DatagramInfo::new(None),
+            )
             .await
             .unwrap();
         let resp = Message::from_vec(data.as_slice()).unwrap();
@@ -1336,11 +1344,7 @@ hook_point:
     fn test_inner_dns_record_manager_caa_records() {
         let manager = InnerDnsRecordManager::new();
         manager
-            .add_record(
-                "web3.buckyos.ai",
-                "CAA",
-                "0 issue \"letsencrypt.org\"",
-            )
+            .add_record("web3.buckyos.ai", "CAA", "0 issue \"letsencrypt.org\"")
             .unwrap();
         manager
             .add_record(
@@ -1573,7 +1577,10 @@ hook_point:
         message.set_checking_disabled(false);
 
         let data = server
-            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .serve_datagram(
+                message.to_vec().unwrap().as_slice(),
+                DatagramInfo::new(None),
+            )
             .await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
@@ -1593,7 +1600,10 @@ hook_point:
         message.set_checking_disabled(false);
 
         let data = server
-            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .serve_datagram(
+                message.to_vec().unwrap().as_slice(),
+                DatagramInfo::new(None),
+            )
             .await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
@@ -1608,7 +1618,10 @@ hook_point:
         message.set_checking_disabled(false);
 
         let data = server
-            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .serve_datagram(
+                message.to_vec().unwrap().as_slice(),
+                DatagramInfo::new(None),
+            )
             .await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();
@@ -1623,7 +1636,10 @@ hook_point:
         message.set_checking_disabled(false);
 
         let data = server
-            .serve_datagram(message.to_vec().unwrap().as_slice(), DatagramInfo::new(None))
+            .serve_datagram(
+                message.to_vec().unwrap().as_slice(),
+                DatagramInfo::new(None),
+            )
             .await;
         assert!(data.is_ok());
         let resp = Message::from_vec(data.unwrap().as_slice()).unwrap();

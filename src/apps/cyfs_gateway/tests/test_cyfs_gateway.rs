@@ -106,7 +106,6 @@ mod tests {
     const SOCKS_VERSION: u8 = 0x05;
     const SOCKS_AUTH_NONE: u8 = 0x00;
     const SOCKS_AUTH_USERNAME_PASSWORD: u8 = 0x02;
-    const SOCKS_AUTH_NO_ACCEPTABLE: u8 = 0xff;
     const SOCKS_CMD_CONNECT: u8 = 0x01;
     const SOCKS_ADDR_IPV4: u8 = 0x01;
     const SOCKS_ADDR_DOMAIN: u8 = 0x03;
@@ -414,6 +413,10 @@ function test_js_hook(context, host) {
             test_ptcp_mix_port.to_string().as_str(),
         );
         let config = config.replace(
+            "{{control_server_port}}",
+            control_port.to_string().as_str(),
+        );
+        let config = config.replace(
             "{{echo_direct_port}}",
             echo_direct_port.to_string().as_str(),
         );
@@ -604,7 +607,7 @@ function test_js_hook(context, host) {
                 .handshake(TokioIo::new(stream))
                 .await
                 .unwrap();
-            let request = hyper::Request::get("/api")
+            let request = hyper::Request::get("/api/")
                 .header("Host", "web3.buckyos.com")
                 .version(hyper::Version::HTTP_11)
                 .body(Full::new(Bytes::new()))
@@ -636,7 +639,7 @@ function test_js_hook(context, host) {
                 .handshake(TokioIo::new(stream))
                 .await
                 .unwrap();
-            let request = hyper::Request::get("/test_return")
+            let request = hyper::Request::get("/test_return/")
                 .header("Host", "web3.buckyos.com")
                 .version(hyper::Version::HTTP_11)
                 .body(Full::new(Bytes::new()))
@@ -666,7 +669,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -902,7 +905,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -949,7 +952,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -992,7 +995,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -1034,7 +1037,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -1074,7 +1077,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },
@@ -1283,7 +1286,7 @@ function test_js_hook(context, host) {
                 .unwrap();
 
             let body = json!({
-                "method": "check_username",
+                "method": "admin.clear_state_by_active_code",
                 "params": {
                     "username": "test",
                 },

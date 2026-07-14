@@ -163,6 +163,8 @@ impl TcpConnectionHandler {
         let device_lookup_ip = request_source_addr.ip();
         let mut request = StreamRequest::new(req_stream, dest_addr);
         request.source_addr = Some(request_source_addr);
+        request.conn_source_addr = Some(remote_addr);
+        request.real_source_addr = proxy_source_addr;
         request.dest_port = dest_addr.port();
         if let Some(device_info) = self
             .connection_manager
@@ -1294,6 +1296,81 @@ mod tests {
         }
         tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         assert_eq!(connection_manager.get_all_connection_info().len(), 0);
+    }
+
+    async fn run_tcp_source_vars_case(bind: &str, chain_condition: &str, client_payload: &[u8]) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = listener.local_addr().unwrap().port();
+
+        let chains = format!(
+            r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        {chain_condition} && forward tcp:///127.0.0.1:{echo_port};
+        drop;
+"#
+        );
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(&chains).unwrap();
+
+        let handler_env = build_handler_env(
+            Arc::new(ServerManager::new()),
+            TunnelManager::new(),
+            Arc::new(DefaultLimiterManager::new()),
+            StatManager::new(),
+            Some(Arc::new(GlobalProcessChains::new())),
+        );
+        let stack = TcpStack::builder()
+            .id("test")
+            .bind(bind)
+            .hook_point(chains)
+            .stack_context(handler_env)
+            .build()
+            .await
+            .unwrap();
+        stack.start().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let mut client = TcpStream::connect(bind).await.unwrap();
+        client.write_all(client_payload).await.unwrap();
+
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), listener.accept())
+            .await
+            .expect("process chain did not forward: source vars not exposed as expected");
+        let (mut conn, _) = accepted.unwrap();
+        let mut buf = [0u8; 5];
+        conn.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_tcp_stack_source_vars_direct_connection() {
+        // Direct connection: conn_source mirrors the effective source and no
+        // real_source_* is fabricated (missing keys expand to "").
+        run_tcp_source_vars_case(
+            "127.0.0.1:8180",
+            r#"eq ${REQ.real_source_ip} "" && eq ${REQ.conn_source_ip} "127.0.0.1" && eq ${REQ.source_ip} "127.0.0.1""#,
+            b"hello",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_tcp_stack_source_vars_proxy_protocol() {
+        // PROXY protocol restores the origin: it becomes both the trusted
+        // real_source_* and the effective source_*, while conn_source_* keeps
+        // the direct hop.
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"PROXY TCP4 203.0.113.9 127.0.0.1 5678 80\r\n");
+        payload.extend_from_slice(b"hello");
+        run_tcp_source_vars_case(
+            "127.0.0.1:8181",
+            r#"eq ${REQ.real_source_ip} "203.0.113.9" && eq ${REQ.real_source_port} "5678" && eq ${REQ.conn_source_ip} "127.0.0.1" && eq ${REQ.source_ip} "203.0.113.9" && eq ${REQ.source_port} "5678""#,
+            &payload,
+        )
+        .await;
     }
 
     #[tokio::test]

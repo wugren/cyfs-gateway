@@ -1,5 +1,7 @@
 # Agent Guide (cyfs-gateway)
 
+当前 Beta2.2 是 breaking-change 版本。
+
 本仓库采用分层 Harness Engineering 结构。`AGENTS.md` 只做导航，不承载完整规则细节。
 
 ## 规则优先级

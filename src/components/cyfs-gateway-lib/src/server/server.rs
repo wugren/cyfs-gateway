@@ -743,6 +743,122 @@ pub struct HttpRequestProcessChainVars {
     pub req_real_remote_port: Option<String>,
 }
 
+/// Source variables resolved from a [`StreamInfo`] (and optionally from
+/// trusted forwarded headers) for one HTTP request.
+///
+/// - `source_*`: effective source seen by this hook point (real source when a
+///   trusted restore exists, otherwise the connection source)
+/// - `conn_source_*`: connection-layer direct previous hop
+/// - `real_source_*`: source restored through a trusted mechanism only; never
+///   fabricated when no trusted mechanism applies
+///
+/// `*_addr` keeps the raw address string (usually `IP:PORT`, may be a bare IP
+/// when restored from forwarded headers); `*_ip` / `*_port` are only present
+/// when they can be derived.
+#[derive(Default, Debug, Clone)]
+pub struct RequestSourceInfo {
+    pub source_addr: Option<String>,
+    pub source_ip: Option<String>,
+    pub source_port: Option<String>,
+    pub conn_source_addr: Option<String>,
+    pub conn_source_ip: Option<String>,
+    pub conn_source_port: Option<String>,
+    pub real_source_addr: Option<String>,
+    pub real_source_ip: Option<String>,
+    pub real_source_port: Option<String>,
+}
+
+/// Reserved source keys exposed through the HTTP `REQ` map. These keys always
+/// resolve from the connection's [`RequestSourceInfo`] and never fall back to
+/// same-named HTTP headers, so clients cannot forge them.
+pub const HTTP_REQ_SOURCE_KEYS: [&str; 9] = [
+    "source_addr",
+    "source_ip",
+    "source_port",
+    "conn_source_addr",
+    "conn_source_ip",
+    "conn_source_port",
+    "real_source_addr",
+    "real_source_ip",
+    "real_source_port",
+];
+
+fn addr_group_from_str(addr: &str) -> (Option<String>, Option<String>, Option<String>) {
+    if let Ok(socket_addr) = addr.parse::<SocketAddr>() {
+        (
+            Some(addr.to_string()),
+            Some(socket_addr.ip().to_string()),
+            Some(socket_addr.port().to_string()),
+        )
+    } else if addr.parse::<std::net::IpAddr>().is_ok() {
+        (Some(addr.to_string()), Some(addr.to_string()), None)
+    } else {
+        (Some(addr.to_string()), None, None)
+    }
+}
+
+impl RequestSourceInfo {
+    pub fn is_reserved_key(key: &str) -> bool {
+        HTTP_REQ_SOURCE_KEYS.contains(&key)
+    }
+
+    pub fn from_stream_info(info: &StreamInfo) -> Self {
+        let mut this = Self::default();
+        if let Some(addr) = info.src_addr.as_deref() {
+            (this.source_addr, this.source_ip, this.source_port) = addr_group_from_str(addr);
+        }
+        if let Some(addr) = info.conn_src_addr.as_deref() {
+            (
+                this.conn_source_addr,
+                this.conn_source_ip,
+                this.conn_source_port,
+            ) = addr_group_from_str(addr);
+        }
+        if let Some(addr) = info.real_src_addr.as_deref() {
+            (
+                this.real_source_addr,
+                this.real_source_ip,
+                this.real_source_port,
+            ) = addr_group_from_str(addr);
+        }
+        this
+    }
+
+    /// Install `addr` as the trusted restored source and make it the
+    /// effective source as well.
+    pub fn set_real_source(&mut self, addr: &str) {
+        (
+            self.real_source_addr,
+            self.real_source_ip,
+            self.real_source_port,
+        ) = addr_group_from_str(addr);
+        (self.source_addr, self.source_ip, self.source_port) = addr_group_from_str(addr);
+    }
+
+    pub fn get(&self, key: &str) -> Option<&str> {
+        let value = match key {
+            "source_addr" => &self.source_addr,
+            "source_ip" => &self.source_ip,
+            "source_port" => &self.source_port,
+            "conn_source_addr" => &self.conn_source_addr,
+            "conn_source_ip" => &self.conn_source_ip,
+            "conn_source_port" => &self.conn_source_port,
+            "real_source_addr" => &self.real_source_addr,
+            "real_source_ip" => &self.real_source_ip,
+            "real_source_port" => &self.real_source_port,
+            _ => &None,
+        };
+        value.as_deref()
+    }
+
+    fn present_entries(&self) -> Vec<(&'static str, String)> {
+        HTTP_REQ_SOURCE_KEYS
+            .iter()
+            .filter_map(|key| self.get(key).map(|value| (*key, value.to_string())))
+            .collect()
+    }
+}
+
 // 流处理服务
 #[async_trait::async_trait(?Send)]
 pub trait StreamServer: Send + Sync {
@@ -769,6 +885,7 @@ pub fn str_to_http_version(version: &str) -> Option<http::Version> {
 pub struct HttpRequestHeaderMap {
     request: Arc<Mutex<http::Request<UnsyncBoxBody<Bytes, ServerError>>>>,
     transverse_counter: Arc<AtomicU32>, // Indicates if a traversal is currently happening
+    sources: Arc<RequestSourceInfo>,
 }
 
 impl HttpRequestHeaderMap {
@@ -776,6 +893,18 @@ impl HttpRequestHeaderMap {
         Self {
             request: Arc::new(Mutex::new(request)),
             transverse_counter: Arc::new(AtomicU32::new(0)), // Initialize counter to 0
+            sources: Arc::new(RequestSourceInfo::default()),
+        }
+    }
+
+    pub fn new_with_sources(
+        request: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
+        sources: RequestSourceInfo,
+    ) -> Self {
+        Self {
+            request: Arc::new(Mutex::new(request)),
+            transverse_counter: Arc::new(AtomicU32::new(0)),
+            sources: Arc::new(sources),
         }
     }
 
@@ -848,6 +977,12 @@ impl MapCollection for HttpRequestHeaderMap {
             return Err(msg);
         }
 
+        if RequestSourceInfo::is_reserved_key(key) {
+            let msg = format!("Cannot insert read-only source variable '{}'", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
         let mut request = self.request.lock().unwrap();
         let header = value.try_as_str()?.parse().map_err(|e| {
             let msg = format!("Invalid header value '{}': {}", value, e);
@@ -878,6 +1013,12 @@ impl MapCollection for HttpRequestHeaderMap {
     ) -> Result<Option<CollectionValue>, String> {
         if self.is_during_traversal() {
             let msg = format!("Cannot insert header '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        if RequestSourceInfo::is_reserved_key(key) {
+            let msg = format!("Cannot set read-only source variable '{}'", key);
             warn!("{}", msg);
             return Err(msg);
         }
@@ -974,6 +1115,15 @@ impl MapCollection for HttpRequestHeaderMap {
     }
 
     async fn get(&self, key: &str) -> Result<Option<CollectionValue>, String> {
+        if RequestSourceInfo::is_reserved_key(key) {
+            // Reserved source keys resolve from stream info only; a
+            // same-named HTTP header must never shadow them.
+            return Ok(self
+                .sources
+                .get(key)
+                .map(|value| CollectionValue::String(value.to_string())));
+        }
+
         let request = self.request.lock().unwrap();
         if key == "path" {
             Ok(Some(CollectionValue::String(
@@ -1005,6 +1155,9 @@ impl MapCollection for HttpRequestHeaderMap {
     }
 
     async fn contains_key(&self, key: &str) -> Result<bool, String> {
+        if RequestSourceInfo::is_reserved_key(key) {
+            return Ok(self.sources.get(key).is_some());
+        }
         let request = self.request.lock().unwrap();
         if key == "path" || key == "method" || key == "uri" || key == "version" {
             return Ok(true);
@@ -1015,6 +1168,12 @@ impl MapCollection for HttpRequestHeaderMap {
     async fn remove(&self, key: &str) -> Result<Option<CollectionValue>, String> {
         if self.is_during_traversal() {
             let msg = format!("Cannot remove header '{}' during traversal", key);
+            warn!("{}", msg);
+            return Err(msg);
+        }
+
+        if RequestSourceInfo::is_reserved_key(key) {
+            let msg = format!("Cannot remove read-only source variable '{}'", key);
             warn!("{}", msg);
             return Err(msg);
         }
@@ -1059,7 +1218,13 @@ impl MapCollection for HttpRequestHeaderMap {
                     CollectionValue::String(format!("{:?}", request.version())),
                 ),
             ];
+            for (key, value) in self.sources.present_entries() {
+                entries.push((key.to_string(), CollectionValue::String(value)));
+            }
             for (key, value) in request.headers().iter() {
+                if RequestSourceInfo::is_reserved_key(key.as_str()) {
+                    continue;
+                }
                 if let Ok(value_str) = value.to_str() {
                     entries.push((
                         key.as_str().to_string(),
@@ -1099,7 +1264,13 @@ impl MapCollection for HttpRequestHeaderMap {
             "version".to_string(),
             CollectionValue::String(format!("{:?}", request.version())),
         ));
+        for (key, value) in self.sources.present_entries() {
+            result.push((key.to_string(), CollectionValue::String(value)));
+        }
         for (key, value) in request.headers().iter() {
+            if RequestSourceInfo::is_reserved_key(key.as_str()) {
+                continue;
+            }
             if let Ok(value_str) = value.to_str() {
                 result.push((
                     key.as_str().to_string(),
@@ -1615,3 +1786,120 @@ impl ServerManager {
 
 pub type ServerManagerRef = Arc<ServerManager>;
 pub type ServerManagerWeakRef = Weak<ServerManager>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::{BodyExt, Full};
+
+    fn test_request(headers: &[(&str, &str)]) -> http::Request<UnsyncBoxBody<Bytes, ServerError>> {
+        let mut builder = http::Request::builder().method("GET").uri("/test");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
+            .unwrap()
+    }
+
+    #[test]
+    fn test_request_source_info_from_stream_info() {
+        let info = StreamInfo::with_addrs(
+            Some("127.0.0.1:9000".to_string()),
+            Some("198.51.100.7:6001".to_string()),
+        );
+        let sources = RequestSourceInfo::from_stream_info(&info);
+        assert_eq!(sources.source_ip.as_deref(), Some("198.51.100.7"));
+        assert_eq!(sources.source_port.as_deref(), Some("6001"));
+        assert_eq!(sources.conn_source_addr.as_deref(), Some("127.0.0.1:9000"));
+        assert_eq!(sources.real_source_ip.as_deref(), Some("198.51.100.7"));
+
+        // Bare-IP real source (e.g. restored from X-Forwarded-For): the ip is
+        // derivable but the port is not.
+        let mut sources =
+            RequestSourceInfo::from_stream_info(&StreamInfo::new("192.168.1.9:5555".to_string()));
+        assert_eq!(sources.real_source_addr, None);
+        sources.set_real_source("203.0.113.7");
+        assert_eq!(sources.real_source_addr.as_deref(), Some("203.0.113.7"));
+        assert_eq!(sources.real_source_ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(sources.real_source_port, None);
+        // Effective source follows the restored value.
+        assert_eq!(sources.source_ip.as_deref(), Some("203.0.113.7"));
+    }
+
+    #[tokio::test]
+    async fn test_http_req_map_reserved_source_keys() {
+        let info = StreamInfo::with_addrs(
+            Some("127.0.0.1:9000".to_string()),
+            Some("198.51.100.7:6001".to_string()),
+        );
+        let sources = RequestSourceInfo::from_stream_info(&info);
+        // Forged same-named headers must never shadow the reserved keys.
+        let req = test_request(&[("source_ip", "6.6.6.6"), ("x-plain", "1")]);
+        let map = HttpRequestHeaderMap::new_with_sources(req, sources);
+
+        let get = |key: &str| {
+            let map = map.clone();
+            let key = key.to_string();
+            async move {
+                map.get(&key)
+                    .await
+                    .unwrap()
+                    .map(|v| v.try_as_str().unwrap().to_string())
+            }
+        };
+
+        assert_eq!(get("source_ip").await.as_deref(), Some("198.51.100.7"));
+        assert_eq!(
+            get("source_addr").await.as_deref(),
+            Some("198.51.100.7:6001")
+        );
+        assert_eq!(get("conn_source_ip").await.as_deref(), Some("127.0.0.1"));
+        assert_eq!(get("conn_source_port").await.as_deref(), Some("9000"));
+        assert_eq!(get("real_source_ip").await.as_deref(), Some("198.51.100.7"));
+        // Normal headers still resolve.
+        assert_eq!(get("x-plain").await.as_deref(), Some("1"));
+
+        assert!(map.contains_key("real_source_addr").await.unwrap());
+
+        // Reserved keys are read-only.
+        assert!(
+            map.insert("source_ip", CollectionValue::String("9.9.9.9".to_string()))
+                .await
+                .is_err()
+        );
+        assert!(
+            map.insert_new(
+                "real_source_ip",
+                CollectionValue::String("9.9.9.9".to_string())
+            )
+            .await
+            .is_err()
+        );
+        assert!(map.remove("conn_source_addr").await.is_err());
+
+        // dump: reserved keys come from stream info; the forged header is
+        // dropped so the view stays consistent with get().
+        let dumped = map.dump().await.unwrap();
+        let dumped: std::collections::HashMap<String, String> = dumped
+            .into_iter()
+            .map(|(k, v)| (k, v.try_as_str().unwrap().to_string()))
+            .collect();
+        assert_eq!(
+            dumped.get("source_ip").map(String::as_str),
+            Some("198.51.100.7")
+        );
+        assert_eq!(dumped.get("x-plain").map(String::as_str), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn test_http_req_map_absent_source_keys() {
+        // No stream info at all: reserved keys resolve to None instead of
+        // falling back to forged headers.
+        let req = test_request(&[("real_source_ip", "7.7.7.7")]);
+        let map = HttpRequestHeaderMap::new(req);
+        assert!(map.get("real_source_ip").await.unwrap().is_none());
+        assert!(!map.contains_key("real_source_ip").await.unwrap());
+        assert!(map.get("source_addr").await.unwrap().is_none());
+    }
+}

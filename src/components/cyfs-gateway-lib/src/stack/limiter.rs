@@ -121,6 +121,12 @@ impl Limiter {
     }
 }
 
+pub trait LimiterFactory: Send + Sync {
+    fn create_limiter(&self, id: &str) -> Option<Limiter>;
+}
+
+pub type LimiterFactoryRef = Arc<dyn LimiterFactory>;
+
 pub trait LimiterManager: Send + Sync {
     fn new_limiter(
         &mut self,
@@ -134,17 +140,27 @@ pub trait LimiterManager: Send + Sync {
     fn clone_manager(&self) -> Box<dyn LimiterManager>;
     fn retain(&mut self, f: Box<dyn FnMut(&String, &mut Limiter) -> bool>);
     fn remove_limiter(&mut self, id: String);
+    fn set_limiter_factory(&mut self, _factory: Option<LimiterFactoryRef>) {}
 }
 pub type LimiterManagerRef = Arc<Box<dyn LimiterManager>>;
 
 pub struct DefaultLimiterManager {
     limiters: HashMap<String, Limiter>,
+    limiter_factory: Option<LimiterFactoryRef>,
 }
 
 impl DefaultLimiterManager {
     pub fn new() -> Box<dyn LimiterManager> {
         Box::new(Self {
             limiters: HashMap::new(),
+            limiter_factory: None,
+        })
+    }
+
+    pub fn with_limiter_factory(factory: LimiterFactoryRef) -> Box<dyn LimiterManager> {
+        Box::new(Self {
+            limiters: HashMap::new(),
+            limiter_factory: Some(factory),
         })
     }
 }
@@ -169,11 +185,17 @@ impl LimiterManager for DefaultLimiterManager {
     }
 
     fn get_limiter(&self, id: String) -> Option<Limiter> {
-        self.limiters.get(&id).cloned()
+        self.limiters.get(&id).cloned().or_else(|| {
+            self.limiter_factory
+                .as_ref()
+                .and_then(|factory| factory.create_limiter(id.as_str()))
+        })
     }
+
     fn clone_manager(&self) -> Box<dyn LimiterManager> {
         let mut new = Box::new(Self {
             limiters: HashMap::new(),
+            limiter_factory: self.limiter_factory.clone(),
         });
         new.limiters
             .extend(self.limiters.iter().map(|(k, v)| (k.clone(), v.clone())));
@@ -186,6 +208,10 @@ impl LimiterManager for DefaultLimiterManager {
 
     fn remove_limiter(&mut self, id: String) {
         self.limiters.remove(&id);
+    }
+
+    fn set_limiter_factory(&mut self, factory: Option<LimiterFactoryRef>) {
+        self.limiter_factory = factory;
     }
 }
 
@@ -306,5 +332,42 @@ mod tests {
         assert!(parse_speed("100").is_err());
         assert!(parse_speed("100KB").is_err());
         assert!(parse_speed("invalid").is_err());
+    }
+
+    #[test]
+    fn test_default_limiter_manager_dynamic_factory() {
+        struct DynamicLimiterFactory;
+
+        impl LimiterFactory for DynamicLimiterFactory {
+            fn create_limiter(&self, id: &str) -> Option<Limiter> {
+                if id.starts_with("dynamic-") {
+                    Some(Limiter::new_named(
+                        id.to_string(),
+                        None,
+                        Some(1),
+                        Some(4096),
+                        Some(8192),
+                    ))
+                } else {
+                    None
+                }
+            }
+        }
+
+        let mut manager = DefaultLimiterManager::new();
+        let _ = manager.new_limiter("static".to_string(), None, Some(1), Some(1024), Some(2048));
+
+        manager.set_limiter_factory(Some(Arc::new(DynamicLimiterFactory)));
+
+        let static_limiter = manager.get_limiter("static".to_string()).unwrap();
+        assert_eq!(static_limiter.get_id(), Some("static"));
+        assert!(manager.get_limiter("missing".to_string()).is_none());
+
+        let dynamic_limiter = manager.get_limiter("dynamic-client".to_string()).unwrap();
+        assert_eq!(dynamic_limiter.get_id(), Some("dynamic-client"));
+
+        let cloned = manager.clone_manager();
+        let cloned_dynamic = cloned.get_limiter("dynamic-cloned".to_string()).unwrap();
+        assert_eq!(cloned_dynamic.get_id(), Some("dynamic-cloned"));
     }
 }

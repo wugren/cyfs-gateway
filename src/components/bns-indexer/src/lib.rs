@@ -1,22 +1,30 @@
-//! BNS contract validation and local BNS database projection support.
+//! BNS contract event indexer and read projection.
 //!
-//! The first production phase treats `bns-db` as the source of truth and uses
-//! the contract view as an auditable projection. The public traits keep that
-//! boundary explicit so a later phase can switch `TruthSource` to the contract
-//! and reuse the same state model, sqlite backend, and validation reports.
+//! The contract is the authority for BNS state. This crate persists a SQLite
+//! read projection and event log derived from BNS contract logs. The
+//! [`CentralizedBnsRegistry`] facade is read-only by default; its legacy
+//! in-process mutation state machine is only available through the hidden
+//! compatibility constructor used by historical tests.
 
-mod contract;
-mod db;
-mod error;
-mod indexer;
-mod model;
+mod evm_projection;
+mod registry;
 mod sqlite;
-mod validation;
+mod store;
+mod sync;
 
-pub use contract::*;
-pub use db::*;
-pub use error::*;
-pub use indexer::*;
-pub use model::*;
-pub use sqlite::*;
-pub use validation::*;
+pub use bns_client::dns_document;
+pub use bns_client::model::*;
+pub use bns_client::{BnsRegistryError, BnsRegistryResult};
+pub use evm_projection::{
+    checkpoint_from_event, store_event_record, ContractEventProjector, ContractProtocolEvent,
+    ProjectedContractEvent,
+};
+pub use registry::{CentralizedBnsIndexerHandler, CentralizedBnsRegistry};
+pub use sqlite::SqliteBnsRegistryStore;
+pub use store::{BnsRegistryStore, BnsRegistryStoreTx};
+pub use sync::{
+    sync_bns_contract_once, BnsBlockSyncSourceConfig, BnsContractEventIndexer,
+    BnsIndexerSyncConfig, BnsIndexerSyncOutcome,
+};
+
+pub type SqliteBnsDb = SqliteBnsRegistryStore;
