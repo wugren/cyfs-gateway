@@ -159,6 +159,79 @@ mod tests {
         socket.local_addr().unwrap().port()
     }
 
+    async fn start_bns_readiness_server() -> SocketAddr {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(value) => value,
+                    Err(_) => break,
+                };
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        |request: hyper::Request<hyper::body::Incoming>| async move {
+                            let body = request.into_body().collect().await.unwrap().to_bytes();
+                            let request: serde_json::Value =
+                                serde_json::from_slice(&body).unwrap();
+                            assert_eq!(request["method"], "system.info");
+                            let seq = request["sys"][0].as_u64().unwrap();
+                            let response = json!({
+                                "result": {
+                                    "ok": true,
+                                    "result": {
+                                        "ready": true,
+                                        "chain_id": 31337,
+                                        "contract_address": "0x2222222222222222222222222222222222222222",
+                                    },
+                                    "error": null,
+                                },
+                                "sys": [seq],
+                            });
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                                Bytes::from(response.to_string()),
+                            )))
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        addr
+    }
+
+    async fn wait_for_gateway_listener(
+        addr: &str,
+        gateway_task: &mut tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) -> TcpStream {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match TcpStream::connect(addr).await {
+                Ok(stream) => return stream,
+                Err(error) if tokio::time::Instant::now() >= deadline => {
+                    panic!("gateway listener {addr} was not ready before timeout: {error}");
+                }
+                Err(_) => {}
+            }
+
+            if gateway_task.is_finished() {
+                match (&mut *gateway_task).await {
+                    Ok(Ok(())) => panic!("gateway exited before listener {addr} became ready"),
+                    Ok(Err(error)) => {
+                        panic!("gateway startup failed before {addr} was ready: {error}")
+                    }
+                    Err(error) => panic!("gateway task failed before {addr} was ready: {error}"),
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+
     async fn start_echo_server() -> u16 {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -308,6 +381,7 @@ mod tests {
         let upstream_socks_pass = "upstream_pass";
 
         let mut used_tcp_ports = HashSet::new();
+        let bns_rpc_addr = start_bns_readiness_server().await;
         let echo_direct_port = start_echo_server().await;
         assert!(used_tcp_ports.insert(echo_direct_port));
         let echo_proxy_port = start_echo_server().await;
@@ -338,6 +412,7 @@ mod tests {
         let local_dns_file = tempfile::NamedTempFile::with_suffix(".toml").unwrap();
         std::fs::write(local_dns_file.path(), local_dns).unwrap();
         let config = config.replace("{{local_dns}}", local_dns_file.path().to_str().unwrap());
+        let config = config.replace("{{bns_rpc_addr}}", bns_rpc_addr.to_string().as_str());
 
         let json_set = tempfile::NamedTempFile::with_suffix(".json").unwrap();
         let json_set_path = json_set.path().to_path_buf();
@@ -427,7 +502,7 @@ function test_js_hook(context, host) {
 
         std::fs::write(config_file.path(), config).unwrap();
 
-        tokio::spawn(async move {
+        let mut gateway_task = tokio::spawn(async move {
             gateway_service_main(
                 config_file.path(),
                 GatewayParams {
@@ -435,16 +510,11 @@ function test_js_hook(context, host) {
                 },
             )
             .await
-            .unwrap();
         });
-
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
 
         {
             //用tokio库创建一个tcpstream
-            let stream = tokio::net::TcpStream::connect(test1_addr.as_str())
-                .await
-                .unwrap();
+            let stream = wait_for_gateway_listener(test1_addr.as_str(), &mut gateway_task).await;
 
             // 用hyper构造一个http请求
             let (mut sender, conn) = hyper::client::conn::http1::Builder::new()

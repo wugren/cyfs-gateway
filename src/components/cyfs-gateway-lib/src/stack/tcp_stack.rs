@@ -1323,6 +1323,7 @@ mod tests {
             Some(Arc::new(GlobalProcessChains::new())),
         );
         let stack = TcpStack::builder()
+            .server_runtime(test_server_runtime())
             .id("test")
             .bind(bind)
             .hook_point(chains)
