@@ -1,37 +1,42 @@
-# [模块名] Proposal
+---
+module: example-module
+task_name: 001-example-task
+submodule: 001-example-task
+version: v0.6
+status: draft
+approved_by:
+approved_at:
+approved_content_sha256:
+---
 
-## 元数据
-- version: v0.6
-- module: [模块名]
-- stage: proposal
-- status: draft
-- approved_by:
-- approved_at:
+# [Module Name] Proposal
 
-## 状态
-- 人类可读状态：草稿
-- `status` 可选值：`draft`、`reviewing`、`approved`、`approved-baseline`
+## Background and Goal
+<!-- What problem is being solved and why now -->
 
-## 背景与目标
-<!-- 说明要解决什么问题，以及为什么现在做 -->
+## Scope
+### In scope
+### Out of scope
+### Boundary with neighboring modules
 
-## 范围
-### 范围内
-### 范围外
-### 与相邻模块的边界
+## Requirement Review
+<!-- Evaluate whether the requested outcome is reasonable, identify material tradeoffs, and record the chosen direction. -->
 
-## 约束
-- 允许使用的库/组件：
-- 不允许采用的方式：
-- 运行时或部署约束：
+## Proposal Items
+| proposal_id | change_id | requirement | boundary | tradeoff | success_evidence | non_goal |
+|-------------|-----------|-------------|----------|----------|------------------|----------|
+| P-001 | CHG-example | | | | | |
 
-## 高层结果
-<!-- 验收后应该达成什么状态 -->
+## Success Criteria
+- Concrete user-visible or system-visible result:
+- Required evidence:
+- Explicit non-goals:
 
-## 实现准入覆盖
-| 条目 ID | 当前批准内容 | 可直接支持的实现任务 | 需要先补充的情况 |
-|---------|--------------|----------------------|------------------|
-| P-example-change | | | |
+## Risks
+<!-- High-risk changes, shared contracts, security or migration impact -->
 
-## 风险
-<!-- 共享契约、配置默认值、安全、迁移或运行时影响 -->
+## Approval Record
+<!-- Fill only when the user explicitly approves this document. Agents MUST NOT fill this section or set `status: approved` on their own initiative. `approver` must match front matter `approved_by`; `user_statement` must quote the user's approval instruction verbatim. The same edit must record front matter `approved_content_sha256` from `schema-check.py --print-approval-hash <this-file>`; later content edits invalidate approval and require a sibling amendment/fix task. -->
+- approver:
+- approval_date:
+- user_statement: ""

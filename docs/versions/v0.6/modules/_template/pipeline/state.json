@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "plan_sha256": "<sha256-of-sibling-plan.md>",
+  "tasks": {
+    "D-1": {"status": "pending"},
+    "I-1": {"status": "pending"},
+    "T-1": {"status": "pending"},
+    "A-1": {"status": "pending"},
+    "I-file-1": {"status": "pending"}
+  },
+  "scheduler": {
+    "strategy": "dependency-ready-set",
+    "max_concurrency": "runtime-available-slots",
+    "shared_artifact_owner": "parent-orchestrator",
+    "lock_directory": ".harness/locks",
+    "waves": []
+  },
+  "testing_evidence": [],
+  "testing_case_type_coverage": [],
+  "evidence": {
+    "test_runs": [],
+    "quality_runs": []
+  },
+  "return_records": [],
+  "acceptance": {
+    "status": "pending",
+    "report": null
+  },
+  "exit_conditions": {
+    "blocking_issues_closed": false,
+    "required_evidence_exists": false,
+    "testplan_present": false,
+    "change_coverage_complete": false,
+    "stage_scope_checks_passed": false,
+    "final_acceptance_passed": false
+  }
+}
+

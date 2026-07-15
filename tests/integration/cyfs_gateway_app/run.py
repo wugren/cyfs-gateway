@@ -237,6 +237,57 @@ class UpstreamServer:
             self.thread.join(timeout=5)
 
 
+class BnsRpcServer:
+    def __init__(self):
+        self.httpd = None
+        self.thread = None
+        self.port = None
+
+    def start(self):
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                length = int(self.headers.get("content-length", "0"))
+                request = json.loads(self.rfile.read(length).decode("utf-8"))
+                if self.path != "/kapi/bns" or request.get("method") != "system.info":
+                    self.send_error(404)
+                    return
+                sys_values = request.get("sys") or [0]
+                body = json.dumps(
+                    {
+                        "result": {
+                            "ok": True,
+                            "result": {
+                                "ready": True,
+                                "chain_id": 31337,
+                                "contract_address": "0x2222222222222222222222222222222222222222",
+                            },
+                            "error": None,
+                        },
+                        "sys": [sys_values[0]],
+                    }
+                ).encode("utf-8")
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, fmt, *args):
+                return
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def stop(self):
+        if self.httpd is not None:
+            self.httpd.shutdown()
+            self.httpd.server_close()
+        if self.thread is not None:
+            self.thread.join(timeout=5)
+
+
 class EchoServer:
     def __init__(self):
         self.port = None
@@ -2003,7 +2054,9 @@ servers:
     return config_path
 
 
-def render_web3_fixture_gateway_config(case_dir, fixture_web3_dir, ports, node_rtcp_target):
+def render_web3_fixture_gateway_config(
+    case_dir, fixture_web3_dir, ports, node_rtcp_target, bns_rpc_url
+):
     params = json.loads((fixture_web3_dir / "params.json").read_text(encoding="utf-8"))["params"]
     sn_db = case_dir / "sn_db.sqlite3"
     config = f"""
@@ -2048,7 +2101,7 @@ servers:
             priority: 1
             block: |
               if starts-with ${{REQ.path}} "/sn" then
-                rewrite ${{REQ.path}} "/sn*" "/*" && call-server sn;
+                rewrite ${{REQ.path}} "/sn/*" "/*" && call-server sn;
               else
                 forward "rtcp://{node_rtcp_target}/buckyos-node.test:80";
               end
@@ -2063,6 +2116,9 @@ servers:
       - {json.dumps(params["sn_device_jwt"])}
     db_type: sqlite
     db_path: {sn_db}
+    bns_rpc_url: {json.dumps(bns_rpc_url)}
+    bns_evm:
+      controller_private_key: "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
 """
     config_path = case_dir / "web3_gateway.yaml"
     write_file(config_path, textwrap.dedent(config).strip() + "\n")
@@ -2656,6 +2712,8 @@ def test_rtcp_app_tunnel_roundtrip_with_client_http_stack_forward_and_remote_kee
 def test_buckyos_config_gen_web3_exported_http_reaches_node(case_dir):
     upstream = UpstreamServer()
     upstream.start()
+    bns_rpc = BnsRpcServer()
+    bns_rpc.start()
     runtime_dir = case_dir / "buckyos-config-gen"
     web3_gateway = None
     node_gateway = None
@@ -2690,6 +2748,7 @@ def test_buckyos_config_gen_web3_exported_http_reaches_node(case_dir):
             web3_dir,
             web3_ports,
             node_rtcp_target,
+            f"http://127.0.0.1:{bns_rpc.port}",
         )
         web3_gateway = GatewayProcess(web3_dir, web3_config, runtime_dir / "web3-root")
         node_gateway = GatewayProcess(
@@ -2705,9 +2764,9 @@ def test_buckyos_config_gen_web3_exported_http_reaches_node(case_dir):
         sn_resp = http_json_rpc(
             web3_ports["http"],
             "web3-export.test",
-            "/sn",
-            "check_username",
-            {"username": "itestaliceconfig"},
+            "/sn/kapi/sn/auth",
+            "auth.check_username",
+            {"name": "itestaliceconfig"},
         )
         assert_true(sn_resp.get("result", {}).get("valid"), "web3 sn check_username result")
 
@@ -2734,6 +2793,7 @@ def test_buckyos_config_gen_web3_exported_http_reaches_node(case_dir):
             node_gateway.stop()
         if web3_gateway is not None:
             web3_gateway.stop()
+        bns_rpc.stop()
         upstream.stop()
 
 

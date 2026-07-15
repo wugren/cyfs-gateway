@@ -1,25 +1,7 @@
 # Mechanical quality gates for this repository.
 #
-# harness/scripts/quality-check.py runs every gate below and fails when any
-# gate fails. Acceptance requires a fresh passing quality run artifact under
-# harness/evidence/quality-runs/ whenever this file declares at least one gate.
-#
-# Declare the repository's build/lint/typecheck commands here. Gates must be
-# non-interactive, deterministic, and return a meaningful exit code.
-#
-# An explicitly empty list is a versioned, reviewable decision; record the
-# reason as a comment next to it. A missing file fails closed.
+# quality-check.py is an explicitly user-invoked maintenance command. Normal
+# task execution and acceptance use task-scoped testplan evidence instead.
 schema_version: 1
 gates: []
-# Example (Rust):
-# gates:
-#   - id: build
-#     run: ["cargo", "build", "--workspace"]
-#   - id: clippy
-#     run: ["cargo", "clippy", "--workspace", "--", "-D", "warnings"]
-# Example (Python):
-# gates:
-#   - id: lint
-#     run: ["uv", "run", "--active", "ruff", "check", "."]
-#   - id: typecheck
-#     run: ["uv", "run", "--active", "mypy", "."]
+empty_reason: "Build and lint commands remain explicit maintenance actions; task completion uses task-scoped testplan evidence."

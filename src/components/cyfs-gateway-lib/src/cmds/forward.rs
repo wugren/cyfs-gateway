@@ -185,8 +185,6 @@ Examples:
             (spec.to_string(), 1)
         };
 
-        Url::parse(url.as_str()).map_err(|e| format!("Invalid upstream url '{}': {}", url, e))?;
-
         Ok(UpstreamNode { url, weight })
     }
 
@@ -1110,6 +1108,14 @@ mod tests {
 
         let err = Forward::parse_upstream_map(&map).await.unwrap_err();
         assert!(err.contains("weight must be greater than 0"));
+    }
+
+    #[test]
+    fn test_parse_upstream_accepts_named_token() {
+        let upstream = Forward::parse_upstream("api_a,weight=2").unwrap();
+
+        assert_eq!(upstream.url, "api_a");
+        assert_eq!(upstream.weight, 2);
     }
 
     #[test]

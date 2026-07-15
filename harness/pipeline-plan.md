@@ -2,12 +2,14 @@
 
 ## Trigger
 - Approved proposal: docs/versions/v0.6/modules/gateway-runtime/proposal.md
+- Approved submodule proposal: docs/versions/v0.6/modules/gateway-runtime/http-upstreams/proposal.md
 - User launch confirmed: yes
-- Per-stage user confirmation: not required; user said "确定，自动处理后续步骤"; for `dir-server-range`, user confirmed continuation with "确认"
+- Current launch statement: "批准，自动处理后续步骤"
+- Per-stage user confirmation: not required; user said "确定，自动处理后续步骤"; for `dir-server-range`, user confirmed continuation with "确认"; for `http-upstreams` merge integration, user said "批准，自动处理后续步骤"
 - Auto-confirm completed document stages: yes
 - Version: v0.6
 - Module(s): gateway-runtime
-- change_id values: P-control-server-port-config-1, P-test-server-local-runner-1, P-dir-server-range-1
+- change_id values: P-control-server-port-config-1, P-test-server-local-runner-1, P-dir-server-range-1, P-http-upstreams-1
 
 ## Stage Graph
 | task_id | stage | status | responsibility | scope | parent_task | depends_on | output | done_condition |
@@ -24,6 +26,10 @@
 | I-dir-server-range | implementation | complete | Fix `DirServer` Range parsing and invalid Range response handling. | production code and admission evidence | pipeline | D-dir-server-range | code changes and admission evidence | schema/admission checks passed; implementation scope check is blocked by mixed worktree and cross-stage docs in the same diff |
 | T-dir-server-range | testing | complete | Add and run focused regression tests for exact, open-ended, suffix, malformed, out-of-bounds, and multi-range Range behavior. | test code, testing artifacts, and runnable evidence | pipeline | I-dir-server-range | tests and evidence | focused regression and dir_server tests passed; parent unit artifact includes DirServer step pass but fails later in unrelated QUIC step |
 | A-dir-server-range | acceptance | pending | Audit proposal, design, implementation, tests, and evidence for `P-dir-server-range-1`. | docs/versions/v0.6/reviews/ | pipeline | T-dir-server-range | docs/versions/v0.6/reviews/gateway-runtime-dir-server-range-20260612.md | report concludes accepted or routes concrete fixes |
+| D-http-upstreams-merge | design | complete | Align the direct-submodule design with the approved proposal, current performance-branch behavior, exact conflict paths, Rust interfaces, and trigger coverage. | docs/versions/v0.6/modules/gateway-runtime/http-upstreams/design.md | pipeline | http-upstreams proposal approval | approved submodule design.md | design doc structure, stage scope, approval hash, and submodule schema checks pass |
+| I-http-upstreams-merge | implementation | confirmed | Resolve production/dependency conflicts while preserving named pooling and current timeout/body/trusted-source behavior; discard unrelated RTCP/build drift. | admitted production paths and admission evidence | pipeline | D-http-upstreams-merge | conflict-free production files and admission evidence | schema/admission checks pass, conflict markers are absent, and implementation scope check passes in an isolated merge-result view |
+| T-http-upstreams-merge | testing | pending | Resolve or retain in-file feature tests and run focused compile/upstream/RTCP compatibility validation. | test code already carried by the merge plus machine-readable test evidence | pipeline | I-http-upstreams-merge | focused test-run evidence | declared focused checks pass or a concrete blocking return is recorded; testing scope check passes in an isolated view |
+| A-http-upstreams-merge | acceptance | pending | Independently audit proposal, design, merge result, tests, and evidence for `P-http-upstreams-1`. | docs/versions/v0.6/reviews/ | pipeline | T-http-upstreams-merge | docs/versions/v0.6/reviews/gateway-runtime-http-upstreams-merge-20260714.md | report concludes accepted or routes concrete fixes and passes report validation |
 
 ## Return Routing
 - Proposal issue: return to proposal and re-approve before continuing.
@@ -31,6 +37,10 @@
 - Implementation issue: return to I-control-port after design/admission coverage is corrected.
 - Testing issue: return to T-control-port.
 - Acceptance issue: route to the owning earlier stage named by the acceptance finding.
+- HTTP upstream proposal issue: return to the direct-submodule proposal task and re-approve before continuing.
+- HTTP upstream design issue: return to D-http-upstreams-merge.
+- HTTP upstream implementation issue: return to I-http-upstreams-merge after design/admission coverage is corrected.
+- HTTP upstream testing issue: return to T-http-upstreams-merge.
 
 ## Exit Condition
 - [x] `P-control-server-port-config-1` has approved design coverage.
@@ -48,3 +58,9 @@
 - [x] `DirServer` Range implementation is complete.
 - [x] Focused Range regression evidence exists.
 - [ ] DirServer Range acceptance report is complete.
+- [x] `P-http-upstreams-1` has an approved direct-submodule proposal with current launch provenance.
+- [x] `P-http-upstreams-1` has approved design coverage for the merge integration.
+- [ ] Implementation admission passed for `P-http-upstreams-1`.
+- [ ] HTTP upstream merge conflicts are resolved without unrelated RTCP/build drift.
+- [ ] Focused HTTP upstream and compatibility evidence exists.
+- [ ] HTTP upstream acceptance report concludes `accepted`.

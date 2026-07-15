@@ -90,12 +90,20 @@ fn normalize_config_path_value(value_str: &str, base_dir: &Path) -> String {
     }
 }
 
+fn is_config_path_key(key: &str) -> bool {
+    key == "path"
+        || key.ends_with("_path")
+        // Keep the nginx-compatible directive name while treating it as
+        // a file path during the common configuration normalization pass.
+        || key == "proxy_ssl_trusted_certificate"
+}
+
 //will move to buckyos_kit
 pub fn normalize_all_path_value_config(config: &mut serde_json::Value, base_dir: &Path) {
     if config.is_object() {
         for (key, value) in config.as_object_mut().unwrap() {
             if value.is_string() {
-                if key.ends_with("_path") || key == "path" {
+                if is_config_path_key(key) {
                     let value_str = value.as_str().unwrap();
                     let value_path = normalize_config_path_value(value_str, base_dir);
                     debug!(
@@ -240,7 +248,8 @@ mod test {
                     "tls_only":1,
                     "tls": {
                         "cert_path": "cyfs_gateway.yaml"
-                    }
+                    },
+                    "proxy_ssl_trusted_certificate": "certs/upstream-ca.pem"
                 }
             ],
             "path": "cyfs_gateway.yaml"
@@ -282,6 +291,21 @@ mod test {
                 .unwrap()
                 .replace("\\", "/"),
             "/opt/buckyos/etc/cyfs_gateway.yaml"
+        );
+        assert_eq!(
+            config
+                .get("servers")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .first()
+                .unwrap()
+                .get("proxy_ssl_trusted_certificate")
+                .unwrap()
+                .as_str()
+                .unwrap()
+                .replace("\\", "/"),
+            "/opt/buckyos/etc/certs/upstream-ca.pem"
         );
     }
 }

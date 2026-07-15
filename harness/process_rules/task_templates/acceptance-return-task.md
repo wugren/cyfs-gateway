@@ -1,5 +1,7 @@
 # Acceptance Return Task
 
+> Do not instantiate this task for a proposal ambiguity, contradiction, or incorrect requirement/acceptance boundary. Stop acceptance and ask the user to decide instead.
+
 ## Task Identity
 - Task ID:
 - Triggered By Acceptance Report:
@@ -11,7 +13,9 @@
 ## Reason For Return
 - Blocking issue id:
 - Why acceptance failed:
+- If returning because project-rule-governed architecture docs are inconsistent, list the code path and `docs/architecture/` path that disagree:
 - Why this stage owns the fix:
+- Correctness category: logic/control flow / termination/progress / concurrency/synchronization / resource lifetime/cleanup / state/data integrity / error handling/recovery / interface boundary/compatibility / security/capacity safety / test evidence
 - If returning to testing, list the missing or unreasonable case types: normal / boundary / negative / error / compatibility / lifecycle / cross-module
 
 ## Required Fix Output

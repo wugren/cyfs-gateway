@@ -5,7 +5,7 @@ Wire this in `.claude/settings.json` (see harness/claude-settings-hooks.example.
 the hook receives the pending tool call as JSON on stdin and exits 2 to block it.
 It turns the implementation-admission gate from a prose rule into a mechanical
 one: editing production code is rejected until a valid admission stamp exists
-under harness/evidence/admission/.
+under docs/versions/<version>/evidence/admission/.
 
 A stamp is valid only when admission-check.py wrote it for a today-dated
 evidence file and the recorded proposal.md/design.md hashes still match the
@@ -15,7 +15,7 @@ inside the union of their admitted design Scope Paths.
 
 The guard is a coarse backstop, not the full gate: admission-check.py remains
 the authority on whether the evidence itself is valid, and
-stage-scope-check.py remains the authority on the final implementation diff.
+stage-scope-check.py remains the authority on the final recorded implementation task paths.
 """
 
 from __future__ import annotations
@@ -28,7 +28,7 @@ import sys
 from pathlib import Path
 
 GUARDED_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
-EXEMPT_PREFIXES = ("docs/", "harness/evidence/", ".claude/", ".git/")
+EXEMPT_PREFIXES = ("docs/", ".claude/", ".git/")
 EXEMPT_SUFFIXES = (".md", ".markdown", ".txt")
 STAMP_SCHEMA = 1
 
@@ -96,20 +96,22 @@ def stamp_scope_paths(stamp_path: Path, project_dir: Path) -> list[str] | None:
 
 
 def todays_admitted_scope(project_dir: Path) -> list[str]:
-    evidence_dir = project_dir / "harness" / "evidence" / "admission"
-    if not evidence_dir.is_dir():
+    versions_dir = project_dir / "docs" / "versions"
+    if not versions_dir.is_dir():
         return []
     today = datetime.date.today().strftime("%Y%m%d")
     scope: list[str] = []
-    for stamp_path in evidence_dir.glob(f"{today}-*.stamp.json"):
-        entries = stamp_scope_paths(stamp_path, project_dir)
-        if not entries:
+    for evidence_dir in sorted(versions_dir.glob("*/evidence/admission")):
+        if not evidence_dir.is_dir():
             continue
-        for entry in entries:
-            if entry not in scope:
-                scope.append(entry)
+        for stamp_path in evidence_dir.glob(f"{today}-*.stamp.json"):
+            entries = stamp_scope_paths(stamp_path, project_dir)
+            if not entries:
+                continue
+            for entry in entries:
+                if entry not in scope:
+                    scope.append(entry)
     return scope
-
 
 def in_scope_paths(path: str, scope_paths: list[str]) -> bool:
     for entry in scope_paths:
@@ -148,9 +150,9 @@ def main() -> int:
     if not scope:
         print(
             f"edit-guard: blocked edit to production file '{path}': no valid admission "
-            "stamp dated today exists under harness/evidence/admission/. "
+            "stamp dated today exists under docs/versions/<version>/evidence/admission/. "
             "Complete implementation admission first: read the approved proposal.md "
-            "and design.md, create harness/evidence/admission/<YYYYMMDD>-<task-slug>.md, "
+            "and design.md, create docs/versions/<version>/evidence/admission/<YYYYMMDD>-<task-slug>.md, "
             "and pass schema-check.py and admission-check.py (which writes the stamp). "
             "A stale stamp means a bound document changed after admission; rerun "
             "admission-check.py to regenerate it. "

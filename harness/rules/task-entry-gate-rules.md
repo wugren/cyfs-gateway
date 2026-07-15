@@ -1,107 +1,112 @@
 # Task Entry Gate Rules
 
 ## Goal
-- Prevent implementation, bugfix, optimization, and refactor requests from bypassing versioned document admission and moving directly into code changes.
+- Prevent implementation, bugfix, optimization, and refactor requests from bypassing versioned document admission.
 
 ## Priority
-- This is the highest-priority entry rule for task classification and implementation admission.
-- Apply this rule before reading task-type process rules or editing any repository artifact.
+- This is the highest-priority rule for task classification and implementation admission.
+- Apply it before task-type process rules or repository edits.
+- Narrow exception: after an explicit current user launch whose verbatim instruction is recorded as task-local `pipeline/plan.md` `User launch statement`, `auto-pipeline-rules.md` has higher priority only for its no-`design.md` / no-`testing.md` policy and use of validated pipeline-plan design mappings. Agents never infer or synthesize launch. The exception does not relax any other entry, approval, scope, or validation gate.
+
+## Harness Rule Activation
+- All harness rules apply by default.
+- An explicit current user instruction to skip all harness rules disables every harness rule for the scope named by the user. If the user names no scope, apply the skip only to the current task.
+- Evaluate this explicit all-rules opt-out before this task entry gate and every other harness rule. Do not infer the opt-out from urgency, a request to proceed, or user silence.
+- The opt-out does not override system or developer instructions, safety requirements, remaining user scope constraints, or repository requirements outside the harness.
 
 ## Scope
-- requests involving code
-- requests involving tests
-- requests involving runtime behavior
-- requests involving UI behavior
-- requests involving build behavior
-- bugfix, optimization, refactor, and implementation requests
+- Code, test, runtime, UI, build, bugfix, optimization, refactor, and implementation-shaped requests.
 
-## Stage Write-Scope Rule
+## Task Packet Rule
+- Every new manual-flow task MUST use a packet with its own `proposal.md`, `design.md`, optional `testing.md`, and optional `acceptance.md`.
+- Every explicitly launched auto-pipeline task MUST use a packet with `proposal.md`, `pipeline/plan.md`, `pipeline/state.json`, and later `testplan.yaml`; generated `design.md`, task-local `design/`, `testing.md`, and `testing/` are forbidden. Admission-relevant design mappings are recorded in plan; mutable testing coverage and execution status are recorded in state.
+- Every new task name MUST use `<task-seq>-<task-slug>`; `<task-seq>` is a version-local sequence number, defaults to 3 digits, starts at `001` for each version, and increments by 1 across all project modules and `globals` in that version.
+- When creating a task packet, run `UV_CACHE_DIR=.harness/uv-cache uv run --active python ./harness/scripts/task-seq.py next --version <version> --slug <task-slug>` and use the returned `<task-seq>-<task-slug>` for the directory, front matter `task_name`, checker `--submodule`, and unfinished-task index `task_id`.
+- Sequence numbers identify creation order only; do not use the largest number to decide the current/latest task.
+- Single-project task packet: `docs/versions/<version>/modules/<project>/<task-seq>-<task-slug>/`.
+- Cross-project task packet: `docs/versions/<version>/modules/globals/<task-seq>-<task-slug>/`.
+- Do not modify an existing task packet to describe new work.
+- A task packet document with `status: approved` is frozen by default. New requirements, new APIs, new `change_id` values, scope expansion, success-criteria changes, or downstream supplements MUST create a sibling task packet instead of editing the approved packet.
+- Corrections to an approved task MUST create a sibling amendment/fix task packet that names the original packet and explains the correction reason; do not directly edit the original approved document.
+- Project-level module packets may contain long-lived overviews, but new implementation admission MUST bind to the current task packet.
+- Maintain `docs/versions/<version>/modules/tasks.md` as the unfinished-task index: add new task packets when created, remove task records when completed, and keep only unfinished tasks in the file.
+- "Latest task" MUST NOT be decided by directory order, timestamps, or agent guessing. It must come from the current user request or a `docs/modules/<module>.md` Current/Active Task field.
+- If the new task clearly belongs to a different module than every relevant unfinished task record, create a new task packet immediately and do not consider continuing any unfinished task from another module.
+- If `docs/versions/<version>/modules/tasks.md` lists multiple same-module unfinished tasks and the user request does not identify one, stop and confirm whether to use an existing task or create a new sibling task packet.
+- Only the explicitly pointed latest task packet whose current-stage document is not `status: approved` may receive further current-stage edits.
+
+## Stage Write Scope
 - When the user explicitly enters one stage, that stage is the only write scope by default.
-- Proposal-stage tasks MUST modify only `proposal.md` files in the active module or submodule packet.
-- Design-stage tasks MUST modify only `design.md`, `design/`, direct submodule packet design files, and required long-lived boundary sync.
-- Testing-stage tasks MUST modify only test code, test fixtures, test runners, and optional testing artifacts such as `testing.md`, `testing/`, `testplan.yaml`, and direct submodule packet testing files.
-- Implementation-stage tasks MUST modify only production code, required non-test runtime/build resources, and the task admission evidence file under `harness/evidence/admission/` after implementation admission passes.
-- Acceptance-stage tasks MUST audit evidence, generate or finalize acceptance rules and expected results, and write review reports only.
-- A task MUST NOT edit multiple stage artifact groups unless the user explicitly names the stages or explicitly asks for cross-stage synchronization.
-- "Explicitly" means the user's own words, not an inference: a multi-stage task MUST record the user's verbatim authorizing statement in its evidence file or produced report. If no quotable statement exists, the task is single-stage.
-- Changing an upstream document does not automatically authorize downstream document edits. If downstream artifacts need updates, record the return route or follow-up unless the user explicitly requested those downstream edits.
-- Before finishing a single-stage task, run `uv run --active python ./harness/scripts/stage-scope-check.py --stage <stage> --version <version> --module <module>` (plus `--submodule <submodule>` for submodule packets) and treat any out-of-stage diff as a task failure. Proposal, design, and testing runs refuse to start without `--version` and `--module`, so another module's documents can never pass the check.
-- Implementation-stage scope checks additionally require `--change-id <change_id>` (repeatable): the checker loads the admitted design `Scope Paths` entries and fails when any changed production path falls outside them, so every changed line is mechanically bound to its admitted `change_id`.
-- When the working tree contains unrelated changes from other tasks, run the scope check against committed work with `--base <ref>` instead of accepting a noisy worktree; the default mode checks the whole worktree and will correctly flag mixed-task diffs.
+- Proposal: active packet `proposal.md`, plus the unfinished-task index `docs/versions/<version>/modules/tasks.md` when creating or closing task records.
+- Design: only `design.md`, task-local `design/`, required long-lived boundary sync, project-rule-required `docs/architecture/` updates, and task-local `pipeline/plan.md` plus `pipeline/state.json` during an explicitly launched auto-pipeline.
+- Testing: only test code, fixtures, runners, unified entrypoint wiring (`harness/scripts/test-run.py`), generated run evidence under `test-results/test-runs/*.json`, optional `testing.md`, `testing/`, `testplan.yaml`, and task-local `pipeline/state.json` coverage/status during an explicitly launched auto-pipeline.
+- Testing treats code inside an existing Rust `#[cfg(test)]` item as test code, but new unit tests MUST use dedicated test files, test directories, or test-only crates/packages rather than new inline test bodies in production source files.
+- Implementation: only production code, required non-test runtime/build resources, task admission evidence after admission passes, and task-local `pipeline/state.json` status during an explicitly launched auto-pipeline.
+- Acceptance: review report, optional manual-flow `acceptance.md`, and task-local `pipeline/state.json` final/return status during an explicitly launched auto-pipeline.
+- Acceptance: only evidence audit, architecture-doc validation, generated/final acceptance rules and expected results, and review reports.
+- A task MUST NOT edit multiple stage artifact groups unless the user explicitly names the stages or asks for cross-stage synchronization.
+- Multi-stage authorization MUST be recorded from the user's own words in the evidence file or produced report; otherwise the task is single-stage.
+- Every single-stage task MUST maintain `docs/versions/<version>/evidence/stage-scope/<task-id>.paths`, one repo-relative path per line, plus `<task-id>.paths.meta.json` recording schema `1`, stage, version, module, optional submodule, optional `.harness/baselines/<task-id>/manifest.json`, and implementation `change_ids`.
+- Bootstrap and Harness refresh create project-root `.harness/` and ensure `.gitignore` contains `.harness/` without removing existing entries. Runtime files under `.harness/` are omitted from task path manifests.
+- Every direct `uv` invocation uses `UV_CACHE_DIR=.harness/uv-cache`; root shortcuts set the equivalent absolute project-local cache path before any `uv` command. Do not allocate per-task `UV_CACHE_DIR` paths under `/tmp`.
+- A testing task that edits an existing Rust inline test MUST capture the target before editing with `harness/scripts/baseline-snapshot.py`. Never synthesize a baseline through `GIT_INDEX_FILE`, `git read-tree`, `git write-tree`, or `git commit-tree`.
+- Changing an upstream document does not authorize downstream edits. Record the return route or follow-up unless the user explicitly requested those edits.
+- Before finishing a single-stage task, run `UV_CACHE_DIR=.harness/uv-cache uv run --active python ./harness/scripts/stage-scope-check.py --stage <stage> --version <version> --module <module> --changed-paths-file docs/versions/<version>/evidence/stage-scope/<task-id>.paths` plus `--submodule <task-seq>-<task-slug>` for task packets.
+- Do not rerun a passing stage-scope check unless the manifest, sidecar metadata, baseline, a governed task path, or the admitted design Scope Paths changed after that pass. Acceptance and `check-all.py` reuse the existing result.
+- Implementation-stage scope checks also pass concrete `--target-module <project>` and repeatable `--change-id <change_id>` so recorded paths are bound to the correct project's admitted design `Scope Paths`.
+- Whole-worktree git status or diff is diagnostic only; task completion evidence MUST use the explicit path manifest.
 
-## Approval Authority Rule
-- Agents MUST NOT set `status: approved`, or fill `approved_by` / `approved_at`, on any stage document on their own initiative.
-- Document-stage tasks deliver `status: draft` by default; finishing a proposal, design, or testing task does NOT approve the document.
-- The draft -> approved transition is allowed only when:
-  - the user explicitly approves the document, in which case the same edit MUST fill `## Approval Record` with `approver`, `approval_date`, and a verbatim `user_statement` quoting the user's approval instruction, and `approver` MUST match front matter `approved_by`; or
-  - auto-pipeline mode auto-confirms a completed stage with `approved_by: auto-pipeline`, which is valid only while `harness/pipeline-plan.md` records explicit user launch evidence.
-- Inferred approval, user silence, "the user seemed satisfied", or chat-only statements are NOT approval; leave the document `draft` and ask the user instead.
-- The same edit that applies an approval MUST record front matter `approved_content_sha256`, generated via `schema-check.py --print-approval-hash <doc>`. The hash covers the document content excluding the approval fields themselves, so any later content edit makes the approval stale and `schema-check.py` / `admission-check.py` fail closed until the document is re-approved.
-- `schema-check.py` and `admission-check.py` fail closed on approved documents with missing approval provenance: agent-like `approved_by` values, a missing or placeholder `## Approval Record`, a missing or mismatched `approved_content_sha256`, or `approved_by: auto-pipeline` without recorded pipeline launch evidence.
-- Editing approval front matter, `## Approval Record`, or `approved_content_sha256` to make a check pass without a real user approval instruction is a task failure, not a workaround.
+## Approval Authority
+- Agents MUST NOT set `status: approved` or fill `approved_by` / `approved_at` on stage documents on their own initiative.
+- Document-stage tasks deliver `status: draft` by default.
+- Approval is allowed only from an explicit user approval instruction, recorded in `## Approval Record` with `approver`, `approval_date`, and verbatim `user_statement`, or from auto-pipeline auto-confirm backed by `pipeline/plan.md` launch evidence.
+- Approval metadata may be updated only as part of explicit approval for that document.
+- `schema-check.py` and `admission-check.py` fail closed on missing, placeholder, inconsistent, agent-like, or unverifiable approval provenance.
 
-## Requirement And Scope Classification Rule
-- A request that adds, removes, narrows, widens, or reclassifies goals, scope, non-goals, obligations, supported behavior, unsupported behavior, acceptance boundaries, or success evidence MUST default to proposal stage.
-- Requirement language such as "does not need", "no longer needs", "should not provide", "must provide", "support", "do not support", or equivalent terms MUST be treated as proposal-stage language by default.
-- Do not reinterpret a requirement/scope request as "make the whole packet consistent" unless the user explicitly asks to update downstream documents or asks for cross-stage synchronization.
-- In a proposal-stage task, update `proposal.md`, fill the `## Requirement Challenge` and `## Trigger Matrix` evidence, and record downstream design/implementation/testing/acceptance follow-up there when needed. Do not edit `design.md`, testing artifacts, acceptance artifacts, code, or test code unless the user explicitly requested those stages in the same task.
-- Before proposal-stage completion, run `uv run --active python ./harness/scripts/doc-structure-check.py --version <version> --module <module> --docs proposal` and treat missing challenge or trigger evidence as task failure.
+## Requirement And Scope Classification
+- Requests that add, remove, narrow, widen, or reclassify goals, scope, non-goals, obligations, supported/unsupported behavior, acceptance boundaries, or success evidence default to proposal stage.
+- Requirement language such as "does not need", "no longer needs", "should not provide", "must provide", "support", or "do not support" defaults to proposal stage unless the user explicitly requests downstream synchronization.
+- Proposal-stage work updates `proposal.md`, fills `## Requirement Review` and `## Proposal Items`, and keeps the document focused on requirements, boundaries, tradeoffs, success criteria, `change_id` values, and approval.
+- Before proposal completion, run `UV_CACHE_DIR=.harness/uv-cache uv run --active python ./harness/scripts/doc-structure-check.py --version <version> --module <module> --docs proposal`.
 
-## Task Entry Gate Rule
-- When the user request touches code, tests, runtime behavior, UI behavior, build behavior, bugfixes, optimization, or refactoring, the default path is not immediate code modification.
-- The first task step MUST locate the current versioned module packet.
-- The task MUST identify the active `version`, `module`, and one or more concrete `change_id` values.
-- If the active packet is a direct submodule under a large module, the task MUST also identify the active `submodule`.
-- If the request affects multiple modules, repeat the gate and admission check for each affected module packet.
-- If the request affects multiple direct submodules, repeat the gate and admission check for each affected submodule packet.
-- Before any implementation path starts, the task MUST read:
-  - `proposal.md`
-  - `design.md`
-- Before implementation admission passes, the task MUST create `harness/evidence/admission/<task-id>.md` with a `## Implementation Admission Evidence` table recording `proposal_read`, `design_read`, `change_scope_matches_request`, `active_module_resolved`, and `no_chat_only_evidence`, each with `status` set to `pass`, a concrete source, and task-specific notes.
-- `<task-id>` MUST have the form `<YYYYMMDD>-<task-slug>` where `<YYYYMMDD>` is today's date and `<task-slug>` is a short stable name for the task; `admission-check.py` rejects malformed or future-dated names. Do not reuse a previous task's evidence file.
-- The evidence file MUST also contain `## Document Binding` with the LF-normalized sha256 of the packet's `proposal.md` and `design.md` (generate via `admission-check.py --print-doc-hashes`), and `## Coverage Quotes` with one `### Quote: proposal.md <change_id>` and one `### Quote: design.md <change_id>` block per admitted `change_id`, quoting the covering row or sentence verbatim from the current document.
-- `admission-check.py` re-verifies the hashes and quotes against the current documents and fails closed on any mismatch, so the evidence cannot be written without reading the documents, cannot be reused after a document changes, and becomes invalid if a document is edited after admission.
-- On success, `admission-check.py` writes a machine-readable admission stamp (`harness/evidence/admission/<task-id>.<module>.stamp.json`) recording the bound document hashes and the admitted design `Scope Paths`. The `edit-guard.py` hook blocks production-code edits unless a today-dated stamp is still valid (the recorded hashes must match the current documents) and the edited path falls inside the stamped Scope Paths. Do not hand-write or edit stamp files; only a passing `admission-check.py` run may produce them.
-- Before implementation admission passes, the task MUST run:
-  - `uv run --active python ./harness/scripts/schema-check.py --version <version> --module <module>`
-  - `uv run --active python ./harness/scripts/admission-check.py --version <version> --module <module> --change-id <change_id> --evidence-file harness/evidence/admission/<task-id>.md`
-- For direct submodule packets, pass `--submodule <submodule>` to both checks.
-- Before document reading and direct mapping judgment are complete, the task MUST NOT edit:
-  - code files
-  - build files
-  - resource files
-- If any required proposal/design document is missing, is not `approved`, or does not directly cover the current user request, the task MUST return to the corresponding document stage.
-- Code modification may begin only after `admission-check.py` passes with the task evidence file.
+## Implementation Entry Gate
+- Implementation-shaped requests MUST NOT edit code immediately.
+- First locate or create the active task packet from the current user request, `docs/modules/<module>.md` Current/Active Task, or a confirmed `docs/versions/<version>/modules/tasks.md` unfinished-task record; then identify `version`, `module`, and concrete `change_id` values.
+- Task packets under a project-level module or `globals` MUST identify `submodule=<task-seq>-<task-slug>` for generated checkers.
+- `globals` is a specialized packet-module keyword, not an implementation target. Cross-project work uses `globals/<task-seq>-<task-slug>/` for shared intent and binds each affected project independently with `--module globals --submodule <task-seq>-<task-slug> --target-module <project>`.
+- Do not reuse older task packets for new work, and do not edit approved packets to absorb new work.
+- Before implementation starts, read approved `proposal.md` plus approved `design.md` in manual flow, or the user-launch-confirmed `proposal.md` plus validated `pipeline/plan.md` design mappings and `Scope Paths` in auto-pipeline.
+- Create `docs/versions/<version>/evidence/admission/<evidence-id>.md`, where `<evidence-id>` is `<YYYYMMDD>-<task-slug>` using today's date. The dated evidence id MUST NOT be used as the task packet name or unfinished-index `task_id`; those remain `<task-seq>-<task-slug>`.
+- Admission evidence MUST include `proposal_read`, `design_read`, `change_scope_matches_request`, `active_module_resolved`, `same_module_task_selection`, and `no_chat_only_evidence`, each `pass` with concrete source and notes.
+- Evidence MUST include `## Document Binding` hashes from `admission-check.py --print-doc-hashes` and `## Coverage Quotes` for each admitted `change_id` from proposal plus the active design source (`design.md` or `pipeline/plan.md`).
+- `admission-check.py` re-verifies hashes and quotes against current documents and writes the only valid admission stamp. Do not hand-write stamp files.
+- Before code edits, run:
+  - `UV_CACHE_DIR=.harness/uv-cache uv run --active python ./harness/scripts/schema-check.py --version <version> --module <module>`
+  - `UV_CACHE_DIR=.harness/uv-cache uv run --active python ./harness/scripts/admission-check.py --version <version> --module <module> --change-id <change_id> --evidence-file docs/versions/<version>/evidence/admission/<evidence-id>.md`
+- Add `--submodule <task-seq>-<task-slug>` to both checks for task packets.
+- Code modification may begin only after admission passes with the task evidence file.
+- If schema and admission already passed for the exact current packet documents, evidence, target module, `change_id` values, and Scope Paths, reuse those results. A later stage, acceptance, commit, CI, or report is not a reason to rerun them.
 
-## Default Stage Classification Rule
-- When the user has not explicitly said to enter the proposal, design, testing, or acceptance stage, classify the task by its likely artifact changes.
-- If the request is a requirement, scope, non-goal, supported/unsupported behavior, or acceptance-boundary change, classify it as proposal stage before considering downstream consistency work.
-- If the request would lead to code changes, the task MUST run the implementation admission check first.
-- If the admission check fails, the current task is automatically classified as the earliest missing document stage.
-- If the active module cannot be determined without guessing, return to proposal or design.
-- If the active direct submodule cannot be determined without guessing, return to proposal or design.
-- If no concrete `change_id` maps to the request, return to proposal or design based on the missing coverage.
-- A concrete `change_id` maps to the request only when it appears in the required `change_id` column of the proposal and design mapping tables.
-- User oral requirements, chat context, old implementation, module overviews, and historical notes MUST NOT be treated as admission evidence.
-- If the request has multiple plausible meanings and the ambiguity affects scope, behavior, risk, or validation, route to proposal or the owning upstream document stage instead of silently choosing an interpretation.
-- "Read code first and then decide" permits code inspection only; it does not permit code edits.
-- If code inspection reveals a document gap, the task MUST stop the code path and return to the owning document stage.
+## Default Stage Classification
+- If the user does not explicitly name proposal, design, testing, or acceptance, classify by likely artifact changes.
+- Requirement or acceptance-boundary changes classify as proposal first.
+- Code-changing requests run implementation admission first.
+- Failed admission routes to the earliest missing or non-covering document stage.
+- Missing active module, submodule, or concrete mapped `change_id` routes to proposal or design.
+- `change_id` maps only from the required proposal and design mapping-table columns.
+- Oral requirements, chat context, old implementation, module overviews, and historical notes are not admission evidence.
+- Ambiguity affecting scope, behavior, risk, or validation routes upstream instead of being guessed.
+- "Read code first" permits inspection only. If inspection reveals a document gap, stop the code path and return upstream.
 
 ## Return Routing
-- Missing or unapproved `proposal.md`: return to proposal stage.
-- Missing direct proposal coverage: return to proposal stage.
-- Missing or unapproved `design.md`: return to design stage.
-- Missing direct design coverage, boundary coverage, or interface coverage: return to design stage.
+- Missing task packet or unapproved `proposal.md`: proposal stage.
+- Missing direct proposal coverage: proposal stage.
+- Manual flow missing or unapproved `design.md`: design stage.
+- Auto-pipeline missing pipeline-plan design mapping or concrete `Scope Paths`: auto-pipeline design task.
+- Missing direct design, boundary, or interface coverage in the active design source: design stage.
 
 ## Examples
-
-Classification:
-- "登录接口偶尔报 500，修一下" — bugfix, so it is implementation-shaped: run the entry gate and admission first; do not start editing code, even though the fix looks small.
-- "这个模块不再需要支持匿名访问" — requirement language ("不再需要"): proposal stage by default; edit only `proposal.md` and record downstream follow-up there.
-- "更新一下 design.md，把新的子模块边界写进去" — the user explicitly named the design stage: design write scope only.
-- "看看这段代码为什么慢" — inspection only: reading code is allowed, editing is not; if a fix is then requested, run the entry gate.
-
-Admission outcome:
-- PASS: `proposal.md` and `design.md` are approved with valid provenance, `CHG-login-rate-limit` appears in both mapping tables, today's evidence file binds the doc hashes and quotes the covering rows, and `admission-check.py` exits 0.
-- FAIL: the docs are approved but contain nothing about rate limiting — coverage is missing, so the task returns to proposal/design; "the user told me in chat" does not substitute.
-- FAIL: the evidence file was created yesterday for another task, or a doc was edited after the evidence was written — the hash binding rejects it; regenerate the evidence.
+- "Fix a 500" is implementation-shaped: run entry gate and admission before code edits.
+- "No longer needs X" is proposal-stage requirement language.
+- "Update design.md" is design write scope only.
+- "Look at why this is slow" allows inspection only until a fix is requested.

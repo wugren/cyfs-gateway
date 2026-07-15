@@ -1,107 +1,75 @@
 # Implementation Admission Rules
 
 ## Goal
-- Define the hard prerequisites for starting implementation or bugfix work.
-- This rule is reached only after `task-entry-gate-rules.md` classifies the task and requires implementation admission.
+- Define the hard prerequisites for implementation and bugfix work.
+- This rule applies after `task-entry-gate-rules.md` classifies a request as implementation-shaped.
 
 ## Scope
-- implementation tasks
-- bugfix tasks
-- production code changes for a versioned module
+- Implementation tasks, bugfix tasks, and production code changes for versioned task packets.
 
 ## Required Inputs
-- `docs/versions/<version>/modules/<module>/proposal.md`
-- `docs/versions/<version>/modules/<module>/design.md`
-- `harness/evidence/admission/<task-id>.md`
-- Or, for a direct submodule packet under a large module:
-  - `docs/versions/<version>/modules/<module>/<submodule>/proposal.md`
-  - `docs/versions/<version>/modules/<module>/<submodule>/design.md`
+- Active task packet selected by the current user request, `docs/modules/<module>.md` Current/Active Task, or a confirmed unfinished-task record. Manual flow requires `proposal.md` and `design.md`; explicitly launched auto-pipeline requires `proposal.md` plus `pipeline/plan.md` design mappings and MUST NOT require `design.md`. Packet locations:
+  - `docs/versions/<version>/modules/<project>/<task-seq>-<task-slug>/`
+  - `docs/versions/<version>/modules/globals/<task-seq>-<task-slug>/`
+- `docs/versions/<version>/evidence/admission/<evidence-id>.md`.
 
 ## Admission Rule
-- Implementation admission MUST be evaluated before editing production code, build files, or resources.
-- Implementation MUST NOT start unless all required inputs exist.
-- Implementation MUST NOT start unless proposal and design documents have `status: approved`.
-- Approved status alone does NOT satisfy implementation admission; implementation and bugfix tasks MUST read the approved proposal/design docs and confirm they contain task-relevant coverage for the current change.
-- The read-and-coverage confirmation MUST be recorded in `harness/evidence/admission/<task-id>.md` under `## Implementation Admission Evidence`; chat-only claims or final-answer statements do not satisfy this requirement.
-- The admission evidence table MUST include `proposal_read`, `design_read`, `change_scope_matches_request`, `active_module_resolved`, and `no_chat_only_evidence`, each with `status` set to `pass`, a concrete source, and task-specific notes.
-- The evidence file name MUST be `harness/evidence/admission/<YYYYMMDD>-<task-slug>.md` with today's date; reusing an earlier task's evidence file fails admission.
-- The evidence file MUST bind to the exact approved document content: `## Document Binding` records the LF-normalized sha256 of the packet's `proposal.md` and `design.md` (use `admission-check.py --print-doc-hashes`), and `## Coverage Quotes` records, per admitted `change_id`, a verbatim quote of the covering proposal row and design row. `admission-check.py` re-verifies both against the current documents and fails closed on mismatch.
-- If a bound document changes after the evidence was written, the evidence is stale: re-read the changed document and regenerate the evidence before continuing.
-- A passing `admission-check.py` run writes the admission stamp `harness/evidence/admission/<task-id>.<module>[.<submodule>].stamp.json`; `edit-guard.py` requires a valid stamp before production-code edits and re-verifies the bound document hashes on every edit. Never hand-write or edit a stamp file.
-- Bugfix tasks follow the same rule unless the repository publishes an explicit exception path.
-- Bugfix tasks additionally require red-green regression evidence: before or alongside the fix, the testing stage MUST produce a regression test bound to the bugfix `change_id` that reproduces the defect (a failing run recorded in a `harness/evidence/test-runs/` artifact, or a recorded concrete reason why pre-fix reproduction is not feasible) and passes after the fix. A bugfix whose tests only exercise the happy path does not satisfy this rule.
-- Implementation MUST NOT start unless the active `version`, `module`, and concrete `change_id` values are known.
-- If implementation targets a direct submodule packet, implementation MUST NOT start unless the active `submodule` is also known.
-- Implementation MUST NOT start unless each `change_id` maps through the exact required traceability locations:
-  - `proposal.md` `## Proposal Items` table, `change_id` column
-  - `design.md` `## Directly Mapped Change Items` table, `change_id` column
-- If the request affects multiple modules, each affected module MUST pass admission separately.
-- If the request affects multiple direct submodules, each affected submodule packet MUST pass admission separately.
-- Implementation MUST run `schema-check.py` and `admission-check.py --evidence-file harness/evidence/admission/<task-id>.md` successfully before code edits.
-- For direct submodule packets, implementation MUST run those checks with `--submodule <submodule>`.
-- If approved docs do not yet contain the current change's required content, implementation MUST stop and return work to the owning upstream doc stage before coding starts.
-- Code modification may begin only after `admission-check.py` passes with the task evidence file.
-- Module-level baseline docs, package overviews, historical notes, or oral explanation do not count as sufficient implementation admission.
-- If direct mapping is missing, the default path is to return work upstream, not to implement first and document later.
+- Admission MUST pass before editing production code, build files, or resources.
+- Manual-flow packet docs MUST exist, be `status: approved`, and have valid approval provenance. Auto-pipeline requires an explicit current user launch whose verbatim instruction is recorded as task-local `pipeline/plan.md` `User launch statement`, plus valid dependency/interface/state/failure/alternative design evidence and concrete `Scope Paths`; agents never infer or synthesize launch, and proposal approval metadata is not required.
+- Approved status alone is not enough: the task MUST read the proposal plus active design source (`design.md` or pipeline-plan mappings) and confirm direct coverage.
+- Admission evidence MUST record `proposal_read`, `design_read`, `change_scope_matches_request`, `active_module_resolved`, `same_module_task_selection`, and `no_chat_only_evidence`, each `pass` with concrete source and notes.
+- Evidence file names MUST be `docs/versions/<version>/evidence/admission/<YYYYMMDD>-<task-slug>.md` using today's date.
+- Evidence MUST bind to current approved document content with `## Document Binding` hashes and `## Coverage Quotes` for each admitted `change_id`; `admission-check.py` re-verifies both and fails closed on mismatch.
+- A passing `admission-check.py` run writes `docs/versions/<version>/evidence/admission/<evidence-id>.<module>[.<submodule>][.<target-module>].stamp.json`. Reuse that stamp while its bound documents, evidence, target module, `change_id` values, and Scope Paths remain unchanged. Never hand-write stamp files.
+- Bugfix tasks follow the same rule unless a versioned repo rule defines a narrower exception.
+- Bugfix testing MUST produce red-green regression evidence for the bugfix `change_id`, or a concrete reason pre-fix reproduction is not feasible.
+- The active `version`, `module`, and concrete `change_id` values MUST be known; task packets also require `--submodule <task-seq>-<task-slug>`.
+- If the requested task module is clearly different from every relevant unfinished task record, implementation admission MUST use a new task packet for the requested module and MUST NOT reuse an unfinished task from another module.
+- Each admitted `change_id` MUST appear in `proposal.md` `## Proposal Items` and either manual `design.md` `## Directly Mapped Change Items` or auto-pipeline `pipeline/plan.md` `## Implementation Scope Bindings`.
+- `globals` is a specialized packet-module keyword, not a production target. Cross-project requests use a `globals/<task-seq>-<task-slug>/` packet for shared intent and admit each affected project independently with `--module globals --submodule <task-seq>-<task-slug> --target-module <project>`.
+- Older packets, broad module overviews, historical notes, oral context, or chat claims do not satisfy admission for new work.
+- If direct coverage is missing from approved docs, create or route to a sibling task packet or amendment/fix task instead of editing the approved packet or implementing first and documenting later.
+
+## Required Commands
+- Run the following only when no passing result exists for the current inputs or when their owned inputs changed. Do not replay them in acceptance or `check-all.py`.
+- `UV_CACHE_DIR=.harness/uv-cache uv run --active python ./harness/scripts/schema-check.py --version <version> --module <module>`
+- `UV_CACHE_DIR=.harness/uv-cache uv run --active python ./harness/scripts/admission-check.py --version <version> --module <module> --change-id <change_id> --evidence-file docs/versions/<version>/evidence/admission/<evidence-id>.md`
+- Add `--submodule <task-seq>-<task-slug>` to both commands for task packets.
+- For a `globals` packet, also add `--target-module <project>` and repeat admission independently for every affected project.
 
 ## Allowed Changes
-- production code
-- required non-test runtime/build resources
-- task admission evidence under `harness/evidence/admission/`
+- Production code.
+- Required non-test runtime/build resources.
+- Task admission evidence under `docs/versions/<version>/evidence/admission/`.
 
 ## Execution Guardrails
-- Implement the minimum production code needed to satisfy the approved proposal, design, and current request.
-- Keep every changed production path inside the admitted design `Scope Paths`. Before completion, run `uv run --active python ./harness/scripts/stage-scope-check.py --stage implementation --version <version> --module <module> --change-id <change_id>` (repeat `--change-id` per admitted id; add `--submodule <submodule>` for submodule packets); an out-of-scope diff is a task failure.
-- If the implementation legitimately needs paths outside the admitted Scope Paths, that is missing design coverage: return to the design stage to extend the `Scope Paths` mapping (and re-run admission), or split the extra paths into their own admitted task. Do not widen the diff silently.
-- Leave test implementation for the post-implementation testing stage unless the user explicitly requested a combined implementation/testing task.
-- Touch only files and lines required by the admitted task.
+- Implement the minimum production change needed to satisfy the governing proposal/design and current request.
+- Keep changed production paths inside admitted design `Scope Paths`.
+- When the approved design lists multiple file-level modules, implementation MUST follow `## File-Level Implementation Sequence` in dependency order and create child tasks in that order.
+- Each file-level implementation child task MUST limit its context to the relevant proposal/design excerpts, child design document, `change_id`, `Scope Paths`, interfaces, and source files for that file-level module.
+- Record task paths in `docs/versions/<version>/evidence/stage-scope/<task-id>.paths`, then run `stage-scope-check.py --stage implementation --version <version> --module <module> --change-id <change_id> --changed-paths-file ...` before completion.
+- If extra paths are legitimately needed, return to design to extend `Scope Paths` or split the work into a separate admitted task.
+- Leave test implementation for post-implementation testing unless the user explicitly requested combined implementation/testing.
 - Match surrounding style, naming, and structure.
-- Do not refactor, reformat, rewrite comments, rename symbols, or clean adjacent code unless the admitted task requires it.
-- Do not add unrequested features, options, extension points, configuration, or defensive handling for scenarios ruled out by approved docs or reachable code paths.
-- Remove only unused imports, variables, functions, or files made unused by the current change.
-- If unrelated dead code or defects are noticed, record them as residual risk or follow-up instead of repairing them in the implementation task.
-- Every changed line MUST be traceable in acceptance evidence to the current task's approved docs, requested behavior, or required verification.
-- Every changed line MUST be traceable in acceptance evidence to at least one admitted `change_id`.
+- Do not refactor, reformat, rename, rewrite comments, add features/options, or clean adjacent code unless admitted by the task.
+- Remove only artifacts made unused by the current change.
+- Record unrelated defects as residual risk or follow-up instead of fixing them inside the implementation task.
+- Acceptance evidence MUST trace every changed line to the approved docs, requested behavior, and at least one admitted `change_id`.
 
 ## Forbidden Changes
-- `proposal.md`
-- `design.md`
-- `design/`
-- `testing.md`
-- `testing/`
-- `testplan.yaml`
-- `acceptance.md`
-- test code and test fixtures, unless the user explicitly requested a combined implementation/testing task
+- Proposal, design, testing, acceptance, and test artifacts unless the user explicitly requested the relevant stage in the same task.
 
 ## Verification Default
 - Repositories may choose a strict default where implementation does not proactively run validation commands.
-- In that mode, tests run only when:
-  - the user explicitly requests validation
-  - debugging needs fresh evidence
-  - task docs or repo-local rules explicitly require validation
-- "quick sanity check", "minimal self-test", and similar habitual reasons are not valid exceptions.
+- In that mode, tests run only when the user asks, debugging needs evidence, or task docs/repo-local rules require validation.
 
 ## Rust Formatting Default
-- For Rust repositories, agents MUST NOT automatically run `cargo fmt`.
-- `cargo fmt` may run only when the user explicitly requests formatting or repo-local rules explicitly require it for the current task.
+- Rust agents MUST NOT automatically run `cargo fmt`; run it only on explicit user request or repo-local rule.
 
 ## Return Routing
-- Missing or draft proposal: return to proposal task
-- Missing or draft design: return to design task
-- Missing direct proposal mapping: return to proposal task
-- Missing direct design mapping or changed boundaries/interfaces: return to design task
-- Missing active module or `change_id`: return to proposal or design task
-- Missing active submodule for work that belongs to a direct submodule packet: return to proposal or design task
-- Missing or failing admission evidence file: return to implementation admission setup before code edits
-- Implementation diff outside the admitted design Scope Paths: return to design to extend the `Scope Paths` mapping, or split the out-of-scope edits into their own admitted task
-- Failed schema or admission checker: return to the owning document stage named by the checker output
-- Approved proposal/design docs exist but do not yet cover the current task in enough detail: return to the owning proposal/design task to supplement docs first
-- Upstream contradiction discovered during implementation: return to the owning upstream stage instead of patching docs in place
-
-## Examples
-
-`change_id` quality:
-- GOOD: `CHG-login-rate-limit`, `CHG-cfg-reload-sighup` — each names one concrete behavior or contract.
-- BAD: `misc`, `bugfix`, `module-update`, `cleanup` — too broad; `admission-check.py` rejects them.
-
-Admission evidence: see `harness/evidence/admission-evidence.template.md` for the required shape. A valid file is dated today, binds the packet's `proposal.md` / `design.md` hashes, and quotes the covering mapping rows verbatim. Filling the table with `pass` without reading the documents does not work: the hashes and quotes are re-verified against the current document content.
+- Missing/draft proposal or missing direct proposal mapping: proposal task.
+- Manual flow missing/draft design, or either flow missing direct design mapping, changed boundaries/interfaces, or out-of-scope task paths: design task. Auto-pipeline writes the correction to pipeline-plan mappings rather than `design.md`.
+- Missing active module, task packet, `change_id`, or failing admission evidence: admission setup before code edits.
+- Failed schema/admission checker: owning document stage named by checker output.
+- Approved docs that do not cover the current task: new sibling proposal/design task or amendment/fix task; do not edit the approved packet.
+- Upstream contradiction discovered during implementation: owning upstream stage.

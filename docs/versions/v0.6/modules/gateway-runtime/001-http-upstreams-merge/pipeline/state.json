@@ -1,0 +1,82 @@
+{
+  "schema_version": 1,
+  "plan_sha256": "6170b61270afbeec842697326b41d85301ddd81f3fdd3dd5cbf0f2dead015dad",
+  "tasks": {
+    "D-1": {"status": "complete"},
+    "I-1": {"status": "complete"},
+    "T-1": {"status": "complete"},
+    "A-1": {"status": "complete"},
+    "I-cargo": {"status": "complete"},
+    "I-forward": {"status": "complete"},
+    "I-config": {"status": "complete"},
+    "I-host-marker": {"status": "complete"},
+    "I-http-server": {"status": "complete"},
+    "I-router": {"status": "complete"}
+  },
+  "scheduler": {
+    "strategy": "dependency-ready-set",
+    "max_concurrency": "runtime-available-slots",
+    "shared_artifact_owner": "parent-orchestrator",
+    "lock_directory": ".harness/locks",
+    "waves": [
+      {"wave": 1, "tasks": ["D-1"], "serialization_reasons": {}},
+      {"wave": 2, "tasks": ["I-1"], "serialization_reasons": {"I-1": "parent implementation coordination owns shared admission evidence"}},
+      {"wave": 3, "tasks": ["I-cargo"], "serialization_reasons": {"I-cargo": "ordered before dependent parser and runtime type integration"}},
+      {"wave": 4, "tasks": ["I-forward"], "serialization_reasons": {"I-forward": "explicit dependency on resolved dependency surface"}},
+      {"wave": 5, "tasks": ["I-config"], "serialization_reasons": {"I-config": "explicit dependency on forward configuration shape"}},
+      {"wave": 6, "tasks": ["I-host-marker"], "serialization_reasons": {"I-host-marker": "explicit dependency on normalized request policy"}},
+      {"wave": 7, "tasks": ["I-http-server"], "serialization_reasons": {"I-http-server": "overlapping request types require host marker to be settled first"}},
+      {"wave": 8, "tasks": ["I-router"], "serialization_reasons": {"I-router": "compatibility policy depends on final proxy Host semantics"}},
+      {"wave": 9, "tasks": ["T-1"], "serialization_reasons": {"T-1": "post-implementation testing begins after all production tasks"}},
+      {"wave": 10, "tasks": ["A-1"], "serialization_reasons": {"A-1": "acceptance begins after runnable testing evidence"}}
+    ]
+  },
+  "testing_evidence": [
+    {
+      "change_id": "P-http-upstreams-1",
+      "validation_id": "VAL-http-upstreams-merge",
+      "testplan_level": "unit",
+      "testplan_step_id": "http-upstreams-unit",
+      "evidence": "test-results/test-runs/20260715T043629Z-gateway-runtime+001-http-upstreams-merge-all.json",
+      "gap": "no",
+      "gap_manual_reason": "none"
+    }
+  ],
+  "testing_case_type_coverage": [
+    {"change_id": "P-http-upstreams-1", "case_type": "normal", "required": "yes", "validation_id": "VAL-http-upstreams-merge", "level": "unit", "status": "covered", "gap_manual_reason": "none"},
+    {"change_id": "P-http-upstreams-1", "case_type": "boundary", "required": "yes", "validation_id": "VAL-http-upstreams-merge", "level": "unit", "status": "covered", "gap_manual_reason": "none"},
+    {"change_id": "P-http-upstreams-1", "case_type": "negative", "required": "yes", "validation_id": "VAL-http-upstreams-merge", "level": "unit", "status": "covered", "gap_manual_reason": "none"},
+    {"change_id": "P-http-upstreams-1", "case_type": "error", "required": "yes", "validation_id": "VAL-http-upstreams-merge", "level": "unit", "status": "covered", "gap_manual_reason": "none"},
+    {"change_id": "P-http-upstreams-1", "case_type": "compatibility", "required": "yes", "validation_id": "VAL-http-upstreams-merge", "level": "integration", "status": "covered", "gap_manual_reason": "none"},
+    {"change_id": "P-http-upstreams-1", "case_type": "lifecycle", "required": "yes", "validation_id": "VAL-http-upstreams-merge", "level": "unit", "status": "covered", "gap_manual_reason": "none"},
+    {"change_id": "P-http-upstreams-1", "case_type": "cross-module", "required": "yes", "validation_id": "VAL-http-upstreams-merge", "level": "integration", "status": "covered", "gap_manual_reason": "none"}
+  ],
+  "evidence": {
+    "test_runs": [
+      "test-results/test-runs/20260715T043629Z-gateway-runtime+001-http-upstreams-merge-all.json"
+    ],
+    "quality_runs": []
+  },
+  "return_records": [
+    {
+      "issue_id": "HOST-1",
+      "owning_stage": "design",
+      "target_task": "D-1 -> I-router -> T-1",
+      "reason": "Whole-project integration exposed generated add_router rules losing inbound virtual Host under the new proxy default.",
+      "expected_fix_output": "Explicit generated-rule Host preservation plus unit and gateway integration evidence.",
+      "count": 1
+    }
+  ],
+  "acceptance": {
+    "status": "accepted",
+    "report": "docs/versions/v0.6/modules/gateway-runtime/001-http-upstreams-merge/acceptance-report.md"
+  },
+  "exit_conditions": {
+    "blocking_issues_closed": true,
+    "required_evidence_exists": true,
+    "testplan_present": true,
+    "change_coverage_complete": true,
+    "stage_scope_checks_passed": true,
+    "final_acceptance_passed": true
+  }
+}

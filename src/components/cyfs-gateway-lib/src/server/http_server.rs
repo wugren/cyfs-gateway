@@ -5,31 +5,49 @@ use super::http_compression::{
 use super::{into_server_err, server_err};
 use crate::forward::{
     BalanceMethod, ForwardFailureRegistry, ForwardPlan, HttpMethodClass, NextUpstreamCondition,
-    apply_least_time_via_tunnel_mgr,
+    apply_least_time_via_tunnel_mgr, parse_duration_str,
 };
 use crate::global_process_chains::{GlobalProcessChainsRef, create_process_chain_executor};
 use crate::tunnel_url_status::TunnelFailureReason;
 use crate::{
-    GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpRequestProcessChainVars,
-    HttpResponseHeaderMap, HttpServer, JsExternalsManagerRef, ProcessChainConfigs,
-    RequestSourceInfo, Server, ServerConfig, ServerContext, ServerContextRef, ServerError,
+    GlobalCollectionManagerRef, HttpRequestHeaderMap, HttpRequestHostOverride,
+    HttpRequestProcessChainVars, HttpResponseHeaderMap, HttpServer, JsExternalsManagerRef,
+    ProcessChainConfigs, RequestSourceInfo, Server, ServerConfig, ServerContext, ServerContextRef,
+    ServerError,
     ServerErrorCode, ServerFactory, ServerManagerWeakRef, ServerResult, StreamInfo, TunnelManager,
     get_external_commands,
 };
 use cyfs_process_chain::{CollectionValue, CommandControl, EnvRef, ProcessChainLibExecutor};
 use http::Version;
 use http::header::HeaderName;
+#[cfg(test)]
+use http_body_util::combinators::BoxBody;
 use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper::body::{Body, Bytes, Frame};
 use hyper::{Request, StatusCode, http};
 use hyper_util::rt::TokioIo;
 use regex::Regex;
+use rustls::client::WebPkiServerVerifier;
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::crypto::{WebPkiSupportedAlgorithms, verify_tls12_signature, verify_tls13_signature};
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-use rustls::{ClientConfig, DigitallySignedStruct, Error as TlsError, SignatureScheme};
+use rustls::{
+    ClientConfig as RustlsClientConfig, DigitallySignedStruct, Error as TlsError, RootCertStore,
+    SignatureScheme,
+};
 use serde::{Deserialize, Serialize};
+use sfo_http_pool::fixed::client::{
+    Client as FixedHttpClient, ClientBuilder as FixedHttpClientBuilder, Host as FixedHttpHost,
+};
+use sfo_http_pool::{
+    ClientConfig as SfoHttpClientConfig, ClientError as SfoHttpClientError,
+    Connector as SfoHttpConnector, PooledHttpConnection,
+};
+use std::collections::HashMap;
+use std::error::Error;
 use std::fmt::Debug as FmtDebug;
+use std::io;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -196,6 +214,8 @@ pub struct ProcessChainHttpServerBuilder {
     compression: HttpCompressionSettings,
     forward_timeouts: ForwardUpstreamTimeouts,
     trusted_upstreams: Vec<String>,
+    upstreams: HashMap<String, HttpNamedUpstream>,
+    upstream_tls_config: Option<Arc<RustlsClientConfig>>,
 }
 
 // Add setter methods for HttpServerBuilder
@@ -271,6 +291,16 @@ impl ProcessChainHttpServerBuilder {
         self
     }
 
+    pub fn upstreams(mut self, upstreams: HashMap<String, HttpNamedUpstream>) -> Self {
+        self.upstreams = upstreams;
+        self
+    }
+
+    pub fn upstream_tls_config(mut self, tls_config: Arc<RustlsClientConfig>) -> Self {
+        self.upstream_tls_config = Some(tls_config);
+        self
+    }
+
     pub async fn build(self) -> ServerResult<ProcessChainHttpServer> {
         ProcessChainHttpServer::create_server(self).await
     }
@@ -305,6 +335,135 @@ impl ProcessChainHttpServerBuilder {
             brotli_comp_level: clamp_brotli_comp_level(config.brotli_comp_level),
         })
     }
+
+    fn build_named_upstreams(
+        config: &ProcessChainHttpServerConfig,
+    ) -> ServerResult<HashMap<String, HttpNamedUpstream>> {
+        let mut out = HashMap::with_capacity(config.upstreams.len());
+        for (name, upstream) in &config.upstreams {
+            let mut bytes = name.bytes();
+            let valid_first = bytes
+                .next()
+                .map(|byte| byte.is_ascii_alphabetic() || byte == b'_')
+                .unwrap_or(false);
+            let valid_rest =
+                bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
+            if !valid_first || !valid_rest || name.len() > 64 {
+                return Err(server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "invalid http upstream name '{}': expected ^[A-Za-z_][A-Za-z0-9_-]{{0,63}}$",
+                    name
+                ));
+            }
+            if matches!(
+                name.as_str(),
+                "round_robin" | "rr" | "ip_hash" | "hash" | "consistent_hash" | "least_time"
+            ) {
+                return Err(server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "http upstream name '{}' conflicts with forward balance keyword",
+                    name
+                ));
+            }
+            let parsed_url = Url::parse(&upstream.url).map_err(|e| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "invalid url for http upstream '{}': {}",
+                    name,
+                    e
+                )
+            })?;
+            if matches!(parsed_url.scheme(), "http" | "https") && parsed_url.fragment().is_some() {
+                return Err(server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "http upstream '{}' must not contain a URL fragment",
+                    name
+                ));
+            }
+
+            let keepalive = match upstream.keepalive.as_ref() {
+                None | Some(HttpKeepaliveConfig::Enabled(false)) => {
+                    if upstream.keepalive_timeout.is_some() || upstream.keepalive_requests.is_some()
+                    {
+                        return Err(server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "http upstream '{}' keepalive_timeout/keepalive_requests require keepalive",
+                            name
+                        ));
+                    }
+                    None
+                }
+                Some(HttpKeepaliveConfig::Enabled(true)) => Some(HttpKeepaliveSettings {
+                    keepalive: default_upstream_keepalive(),
+                    keepalive_timeout: match upstream.keepalive_timeout.as_ref() {
+                        Some(value) => parse_duration_str(value).map_err(|e| {
+                            server_err!(
+                                ServerErrorCode::InvalidConfig,
+                                "invalid keepalive_timeout for http upstream '{}': {}",
+                                name,
+                                e
+                            )
+                        })?,
+                        None => default_upstream_keepalive_timeout(),
+                    },
+                    keepalive_requests: upstream
+                        .keepalive_requests
+                        .unwrap_or_else(default_upstream_keepalive_requests),
+                }),
+                Some(HttpKeepaliveConfig::Count(0)) => {
+                    return Err(server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "http upstream '{}' keepalive must be greater than 0",
+                        name
+                    ));
+                }
+                Some(HttpKeepaliveConfig::Count(keepalive)) => Some(HttpKeepaliveSettings {
+                    keepalive: *keepalive,
+                    keepalive_timeout: match upstream.keepalive_timeout.as_ref() {
+                        Some(value) => parse_duration_str(value).map_err(|e| {
+                            server_err!(
+                                ServerErrorCode::InvalidConfig,
+                                "invalid keepalive_timeout for http upstream '{}': {}",
+                                name,
+                                e
+                            )
+                        })?,
+                        None => default_upstream_keepalive_timeout(),
+                    },
+                    keepalive_requests: upstream
+                        .keepalive_requests
+                        .unwrap_or_else(default_upstream_keepalive_requests),
+                }),
+            };
+
+            if let Some(settings) = keepalive.as_ref() {
+                if settings.keepalive > u16::MAX as usize {
+                    return Err(server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "http upstream '{}' keepalive must not exceed {}",
+                        name,
+                        u16::MAX
+                    ));
+                }
+                if settings.keepalive_requests == 0 {
+                    return Err(server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "http upstream '{}' keepalive_requests must be greater than 0",
+                        name
+                    ));
+                }
+            }
+
+            out.insert(
+                name.to_string(),
+                HttpNamedUpstream {
+                    url: upstream.url.clone(),
+                    keepalive,
+                },
+            );
+        }
+        Ok(out)
+    }
 }
 
 pub struct ProcessChainHttpServer {
@@ -318,6 +477,75 @@ pub struct ProcessChainHttpServer {
     compression: HttpCompressionSettings,
     forward_timeouts: ForwardUpstreamTimeouts,
     trusted_upstreams: Vec<TrustedUpstreamMatcher>,
+    upstreams: HashMap<String, HttpNamedUpstream>,
+    pooled_http_clients: HashMap<String, PooledHttpClient>,
+    upstream_tls_config: Arc<RustlsClientConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HttpNamedUpstream {
+    url: String,
+    keepalive: Option<HttpKeepaliveSettings>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HttpKeepaliveSettings {
+    keepalive: usize,
+    keepalive_timeout: Duration,
+    keepalive_requests: u64,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedForwardTarget {
+    url: String,
+    upstream_name: Option<String>,
+}
+
+struct PooledHttpClient {
+    client: FixedHttpClient<UnsyncBoxBody<Bytes, ServerError>, ForwardPoolHost>,
+    target_url: Url,
+}
+
+#[derive(Clone, Debug)]
+struct ForwardPoolTarget {
+    upstream_name: String,
+    url: Url,
+}
+
+#[derive(Clone, Debug)]
+struct ForwardPoolHost {
+    target: ForwardPoolTarget,
+}
+
+#[async_trait::async_trait]
+impl FixedHttpHost for ForwardPoolHost {
+    type Target = ForwardPoolTarget;
+
+    async fn target(&self) -> Result<Self::Target, SfoHttpClientError> {
+        Ok(self.target.clone())
+    }
+}
+
+#[derive(Clone)]
+struct ForwardPoolConnector {
+    tls_config: Arc<RustlsClientConfig>,
+    tunnel_manager: TunnelManager,
+    timeouts: ForwardUpstreamTimeouts,
+}
+
+#[derive(Debug)]
+struct PooledUpstreamConnectorError {
+    reason: TunnelFailureReason,
+    message: String,
+}
+
+impl PooledUpstreamConnectorError {
+    fn new(reason: TunnelFailureReason, message: impl Into<String>) -> Self {
+        Self {
+            reason,
+            message: message.into(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -447,8 +675,220 @@ impl<B> Drop for UpstreamBody<B> {
     }
 }
 
+impl std::fmt::Display for PooledUpstreamConnectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl Error for PooledUpstreamConnectorError {}
+
 #[derive(Debug)]
-struct NoCertificateVerifier;
+enum PooledAcquireFailure {
+    Connector(TunnelFailureReason),
+    HttpHandshake,
+    PoolInternal,
+    ConnectionClosed,
+    RequestConfig,
+}
+
+impl ForwardPoolConnector {
+    fn new(
+        tls_config: Arc<RustlsClientConfig>,
+        tunnel_manager: TunnelManager,
+        timeouts: ForwardUpstreamTimeouts,
+    ) -> Self {
+        Self {
+            tls_config,
+            tunnel_manager,
+            timeouts,
+        }
+    }
+
+    fn connector_error(
+        reason: TunnelFailureReason,
+        message: impl Into<String>,
+    ) -> SfoHttpClientError {
+        SfoHttpClientError::Connect(io::Error::other(PooledUpstreamConnectorError::new(
+            reason, message,
+        )))
+    }
+}
+
+#[async_trait::async_trait]
+impl SfoHttpConnector<UnsyncBoxBody<Bytes, ServerError>> for ForwardPoolConnector {
+    type Target = ForwardPoolTarget;
+
+    async fn connect(
+        &self,
+        target: Self::Target,
+        config: SfoHttpClientConfig,
+    ) -> Result<PooledHttpConnection<UnsyncBoxBody<Bytes, ServerError>>, SfoHttpClientError> {
+        let started = std::time::Instant::now();
+        let connection = match target.url.scheme() {
+            "http" => {
+                let host = target.url.host_str().ok_or_else(|| {
+                    Self::connector_error(
+                        TunnelFailureReason::PreConnectDns,
+                        format!("missing host in upstream {}", target.url),
+                    )
+                })?;
+                let port = target.url.port_or_known_default().ok_or_else(|| {
+                    Self::connector_error(
+                        TunnelFailureReason::PreConnectRoute,
+                        format!("missing port in upstream {}", target.url),
+                    )
+                })?;
+                let (stream, _) =
+                    ProcessChainHttpServer::connect_upstream_with_fallback(
+                        host,
+                        port,
+                        self.timeouts.connect_timeout,
+                    )
+                        .await
+                        .map_err(|(reason, message)| Self::connector_error(reason, message))?;
+                timeout(
+                    self.timeouts.http_handshake_timeout,
+                    PooledHttpConnection::handshake(stream, &config),
+                )
+                .await
+                .map_err(|_| {
+                    Self::connector_error(
+                        TunnelFailureReason::TunnelOpen,
+                        format!("http handshake timeout for upstream {}", target.url),
+                    )
+                })?
+            }
+            "https" => {
+                let host = target.url.host_str().ok_or_else(|| {
+                    Self::connector_error(
+                        TunnelFailureReason::PreConnectDns,
+                        format!("missing host in upstream {}", target.url),
+                    )
+                })?;
+                let port = target.url.port_or_known_default().ok_or_else(|| {
+                    Self::connector_error(
+                        TunnelFailureReason::PreConnectRoute,
+                        format!("missing port in upstream {}", target.url),
+                    )
+                })?;
+                let sni_host =
+                    ProcessChainHttpServer::upstream_sni_host(&target.url).map_err(|e| {
+                        Self::connector_error(TunnelFailureReason::TlsHandshake, e.msg())
+                    })?;
+                let server_name = ServerName::try_from(sni_host.clone()).map_err(|e| {
+                    Self::connector_error(
+                        TunnelFailureReason::TlsHandshake,
+                        format!("invalid tls server name {}: {}", sni_host, e),
+                    )
+                })?;
+                let (tcp_stream, _) =
+                    ProcessChainHttpServer::connect_upstream_with_fallback(
+                        host,
+                        port,
+                        self.timeouts.connect_timeout,
+                    )
+                        .await
+                        .map_err(|(reason, message)| Self::connector_error(reason, message))?;
+                let tls_stream = timeout(
+                    self.timeouts.tls_handshake_timeout,
+                    TlsConnector::from(self.tls_config.clone()).connect(server_name, tcp_stream),
+                )
+                    .await
+                    .map_err(|_| {
+                        Self::connector_error(
+                            TunnelFailureReason::TlsHandshake,
+                            format!("tls handshake timeout for upstream {}", target.url),
+                        )
+                    })?
+                    .map_err(|e| {
+                        Self::connector_error(
+                            TunnelFailureReason::TlsHandshake,
+                            format!("tls handshake failed: {}", e),
+                        )
+                    })?;
+                timeout(
+                    self.timeouts.http_handshake_timeout,
+                    PooledHttpConnection::handshake(tls_stream, &config),
+                )
+                .await
+                .map_err(|_| {
+                    Self::connector_error(
+                        TunnelFailureReason::TunnelOpen,
+                        format!("http handshake timeout for upstream {}", target.url),
+                    )
+                })?
+            }
+            _ => {
+                let stream = timeout(
+                    self.timeouts.request_timeout,
+                    self.tunnel_manager.open_stream_by_url(&target.url),
+                )
+                    .await
+                    .map_err(|_| {
+                        Self::connector_error(
+                            TunnelFailureReason::TunnelOpen,
+                            format!(
+                                "timed out opening tunnel upstream '{}' ({})",
+                                target.upstream_name, target.url
+                            ),
+                        )
+                    })?
+                    .map_err(|e| {
+                        Self::connector_error(
+                            TunnelFailureReason::TunnelOpen,
+                            format!(
+                                "failed to open tunnel upstream '{}' ({}): {}",
+                                target.upstream_name, target.url, e
+                            ),
+                        )
+                    })?;
+                timeout(
+                    self.timeouts.http_handshake_timeout,
+                    PooledHttpConnection::handshake(
+                        crate::tunnel_connector::TunnelStreamConnection::new(stream),
+                        &config,
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    Self::connector_error(
+                        TunnelFailureReason::TunnelOpen,
+                        format!("http handshake timeout for upstream {}", target.url),
+                    )
+                })?
+            }
+        };
+
+        match connection {
+            Ok(connection) => {
+                if matches!(target.url.scheme(), "http" | "https") {
+                    self.tunnel_manager
+                        .record_business_success(&target.url, Some(started.elapsed()))
+                        .await;
+                }
+                Ok(connection)
+            }
+            // `open_stream_by_url` owns history for non-HTTP transports.
+            // Recording its error again here would double-count the attempt
+            // and overwrite a canonical failure such as UnsupportedScheme.
+            Err(error) => Err(error),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NoCertificateVerifier {
+    supported_algorithms: WebPkiSupportedAlgorithms,
+}
+
+impl NoCertificateVerifier {
+    fn new(supported_algorithms: WebPkiSupportedAlgorithms) -> Self {
+        Self {
+            supported_algorithms,
+        }
+    }
+}
 
 impl ServerCertVerifier for NoCertificateVerifier {
     fn verify_server_cert(
@@ -464,38 +904,73 @@ impl ServerCertVerifier for NoCertificateVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        verify_tls12_signature(message, cert, dss, &self.supported_algorithms)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer,
+        dss: &DigitallySignedStruct,
     ) -> Result<HandshakeSignatureValid, TlsError> {
-        Ok(HandshakeSignatureValid::assertion())
+        verify_tls13_signature(message, cert, dss, &self.supported_algorithms)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::RSA_PKCS1_SHA1,
-            SignatureScheme::ECDSA_SHA1_Legacy,
-            SignatureScheme::RSA_PKCS1_SHA256,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::ECDSA_NISTP521_SHA512,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::ED25519,
-            SignatureScheme::ED448,
-        ]
+        self.supported_algorithms.supported_schemes()
+    }
+}
+
+#[derive(Debug)]
+struct DepthLimitedServerCertVerifier {
+    inner: Arc<dyn ServerCertVerifier>,
+    max_intermediates: usize,
+}
+
+impl ServerCertVerifier for DepthLimitedServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer,
+        intermediates: &[CertificateDer],
+        server_name: &ServerName,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, TlsError> {
+        if intermediates.len() > self.max_intermediates {
+            return Err(TlsError::General(format!(
+                "upstream certificate chain has {} intermediate certificates, exceeding proxy_ssl_verify_depth {}",
+                intermediates.len(),
+                self.max_intermediates
+            )));
+        }
+        self.inner
+            .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
     }
 }
 
@@ -538,6 +1013,81 @@ impl ProcessChainHttpServer {
                     request_url
                 )
             })
+    }
+
+    fn upstream_host_header(request_url: &Url) -> ServerResult<http::HeaderValue> {
+        let host = request_url.host().ok_or_else(|| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "Missing upstream host in url: {}",
+                request_url
+            )
+        })?;
+        let mut authority = match host {
+            url::Host::Domain(host) => host.to_string(),
+            url::Host::Ipv4(host) => host.to_string(),
+            url::Host::Ipv6(host) => format!("[{}]", host),
+        };
+        if let Some(port) = request_url.port() {
+            authority.push(':');
+            authority.push_str(&port.to_string());
+        }
+        http::HeaderValue::from_str(&authority).map_err(|e| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "Invalid upstream Host header '{}': {}",
+                authority,
+                e
+            )
+        })
+    }
+
+    fn process_chain_overrode_host(
+        req: &http::Request<UnsyncBoxBody<Bytes, ServerError>>,
+    ) -> bool {
+        req.extensions().get::<HttpRequestHostOverride>().is_some()
+    }
+
+    fn apply_default_proxy_host(
+        header: &mut http::HeaderMap,
+        request_url: &Url,
+        process_chain_overrode_host: bool,
+    ) -> ServerResult<()> {
+        if matches!(request_url.scheme(), "http" | "https") && !process_chain_overrode_host {
+            header.insert(http::header::HOST, Self::upstream_host_header(request_url)?);
+        }
+        Ok(())
+    }
+
+    /// Match the wire-version behavior of the existing direct branches.
+    /// HTTPS preserves an inbound HTTP/1.x version; direct HTTP and
+    /// tunnel-backed forwarding use HTTP/1.1.
+    fn upstream_http_version(scheme: &str, inbound: http::Version) -> http::Version {
+        if scheme == "https" {
+            match inbound {
+                http::Version::HTTP_10 => http::Version::HTTP_10,
+                http::Version::HTTP_11 => http::Version::HTTP_11,
+                _ => http::Version::HTTP_11,
+            }
+        } else {
+            http::Version::HTTP_11
+        }
+    }
+
+    fn upstream_request_build_error_code(scheme: &str) -> ServerErrorCode {
+        if scheme == "http" {
+            ServerErrorCode::InvalidConfig
+        } else {
+            ServerErrorCode::BadRequest
+        }
+    }
+
+    fn upstream_send_error_code(scheme: &str) -> ServerErrorCode {
+        if matches!(scheme, "http" | "https") {
+            ServerErrorCode::InvalidConfig
+        } else {
+            ServerErrorCode::TunnelError
+        }
     }
 
     /// Connect outcome carrying the bucket needed for tunnel_mgr history
@@ -626,7 +1176,7 @@ impl ProcessChainHttpServer {
         abort_on_drop: Option<JoinHandle<()>>,
     ) -> UnsyncBoxBody<Bytes, ServerError>
     where
-        B: Body<Data = Bytes, Error = E> + Send + Sync + 'static,
+        B: Body<Data = Bytes, Error = E> + Send + 'static,
         E: FmtDebug + 'static,
     {
         UpstreamBody::new(
@@ -635,14 +1185,6 @@ impl ProcessChainHttpServer {
             abort_on_drop,
         )
         .boxed_unsync()
-    }
-
-    /// Best-effort: parse a candidate URL string into a `Url` suitable
-    /// as the tunnel_mgr history key. Returns `None` if parsing fails;
-    /// callers fall back to skipping history writeback in that case
-    /// (we never want history bookkeeping to mask the real error).
-    fn upstream_history_key(target_url: &str) -> Option<Url> {
-        Url::parse(target_url).ok()
     }
 
     fn origin_form_uri(raw_uri: &str) -> String {
@@ -665,6 +1207,62 @@ impl ProcessChainHttpServer {
         raw_uri.to_string()
     }
 
+    fn proxy_pass_has_uri(target_url: &str) -> bool {
+        let Some((_, authority_and_uri)) = target_url.split_once("://") else {
+            return false;
+        };
+        authority_and_uri
+            .find(|ch| matches!(ch, '/' | '?' | '#'))
+            .and_then(|index| authority_and_uri.as_bytes().get(index).copied())
+            .is_some_and(|byte| matches!(byte, b'/' | b'?'))
+    }
+
+    /// Apply nginx `proxy_pass` URI replacement rules for an implicit
+    /// `location /`. A target without a URI preserves the inbound URI;
+    /// a target with a URI replaces the leading `/` and appends the
+    /// remainder exactly, so the configured trailing slash is significant.
+    fn proxy_pass_origin_uri(
+        target_url: &str,
+        parsed_target: &Url,
+        client_origin_uri: &str,
+    ) -> ServerResult<String> {
+        if parsed_target.fragment().is_some() {
+            return Err(server_err!(
+                ServerErrorCode::InvalidConfig,
+                "http upstream URL must not contain a fragment: {}",
+                target_url
+            ));
+        }
+
+        if !Self::proxy_pass_has_uri(target_url) {
+            return Ok(client_origin_uri.to_string());
+        }
+
+        let client_uri = client_origin_uri.parse::<http::Uri>().map_err(|e| {
+            server_err!(
+                ServerErrorCode::BadRequest,
+                "invalid inbound request URI '{}': {}",
+                client_origin_uri,
+                e
+            )
+        })?;
+        let suffix = client_uri
+            .path()
+            .strip_prefix('/')
+            .unwrap_or(client_uri.path());
+        let mut upstream_uri = format!("{}{}", parsed_target.path(), suffix);
+        if upstream_uri.is_empty() {
+            upstream_uri.push('/');
+        }
+
+        let query = parsed_target.query().or_else(|| client_uri.query());
+        if let Some(query) = query {
+            upstream_uri.push('?');
+            upstream_uri.push_str(query);
+        }
+        Ok(upstream_uri)
+    }
+
     pub fn builder() -> ProcessChainHttpServerBuilder {
         ProcessChainHttpServerBuilder {
             id: None,
@@ -680,6 +1278,8 @@ impl ProcessChainHttpServer {
             compression: HttpCompressionSettings::default(),
             forward_timeouts: ForwardUpstreamTimeouts::default(),
             trusted_upstreams: Vec::new(),
+            upstreams: HashMap::new(),
+            upstream_tls_config: None,
         }
     }
 
@@ -757,6 +1357,19 @@ impl ProcessChainHttpServer {
             None
         };
         let trusted_upstreams = parse_trusted_upstreams(&builder.trusted_upstreams)?;
+        let forward_timeouts = builder.forward_timeouts.clone();
+        let upstreams = builder.upstreams;
+        let upstream_tls_config = match builder.upstream_tls_config {
+            Some(config) => config,
+            None => Self::build_upstream_tls_config(false, None, default_proxy_ssl_verify_depth())?,
+        };
+        let pooled_http_clients = Self::build_pooled_http_clients(
+            &upstreams,
+            builder.tunnel_manager.as_ref().unwrap().clone(),
+            upstream_tls_config.clone(),
+            forward_timeouts.clone(),
+        )
+        .await?;
         Ok(ProcessChainHttpServer {
             id: builder.id.unwrap(),
             version,
@@ -766,9 +1379,150 @@ impl ProcessChainHttpServer {
             post_executor,
             tunnel_manager: builder.tunnel_manager.unwrap(),
             compression: builder.compression,
-            forward_timeouts: builder.forward_timeouts,
+            forward_timeouts,
             trusted_upstreams,
+            upstreams,
+            pooled_http_clients,
+            upstream_tls_config,
         })
+    }
+
+    async fn build_pooled_http_clients(
+        upstreams: &HashMap<String, HttpNamedUpstream>,
+        tunnel_manager: TunnelManager,
+        tls_config: Arc<RustlsClientConfig>,
+        timeouts: ForwardUpstreamTimeouts,
+    ) -> ServerResult<HashMap<String, PooledHttpClient>> {
+        let connector = ForwardPoolConnector::new(tls_config, tunnel_manager, timeouts);
+        let mut clients = HashMap::new();
+        for (name, upstream) in upstreams {
+            let Some(keepalive) = upstream.keepalive.as_ref() else {
+                continue;
+            };
+            let url = Url::parse(&upstream.url).map_err(|e| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "invalid url for pooled http upstream '{}': {}",
+                    name,
+                    e
+                )
+            })?;
+            let host = ForwardPoolHost {
+                target: ForwardPoolTarget {
+                    upstream_name: name.clone(),
+                    url: url.clone(),
+                },
+            };
+            let client = FixedHttpClientBuilder::new_with_host(host)
+                .connector(connector.clone())
+                .pool_max_idle(keepalive.keepalive as u16)
+                // `keepalive` is an idle-cache limit, not an active
+                // connection limit. The fixed client currently exposes a
+                // u16 total limit, so MAX is its practical unlimited value.
+                .pool_max_connections(u16::MAX)
+                .pool_idle_timeout(keepalive.keepalive_timeout)
+                .max_reuse_count(keepalive.keepalive_requests)
+                .http1_only()
+                .retry_canceled_requests(false)
+                .build::<UnsyncBoxBody<Bytes, ServerError>>()
+                .await
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "failed to build pooled http upstream '{}': {}",
+                        name,
+                        e
+                    )
+                })?;
+            clients.insert(
+                name.clone(),
+                PooledHttpClient {
+                    client,
+                    target_url: url,
+                },
+            );
+        }
+        Ok(clients)
+    }
+
+    fn build_upstream_tls_config(
+        verify: bool,
+        trusted_certificate: Option<&str>,
+        verify_depth: usize,
+    ) -> ServerResult<Arc<RustlsClientConfig>> {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier: Arc<dyn ServerCertVerifier> = if verify {
+            let trusted_certificate = trusted_certificate.ok_or_else(|| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "proxy_ssl_trusted_certificate is required when proxy_ssl_verify is true"
+                )
+            })?;
+            let file = std::fs::File::open(trusted_certificate).map_err(|e| {
+                server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "failed to open proxy_ssl_trusted_certificate '{}': {}",
+                    trusted_certificate,
+                    e
+                )
+            })?;
+            let mut reader = std::io::BufReader::new(file);
+            let certificates = rustls_pemfile::certs(&mut reader)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "failed to parse proxy_ssl_trusted_certificate '{}': {}",
+                        trusted_certificate,
+                        e
+                    )
+                })?;
+            if certificates.is_empty() {
+                return Err(server_err!(
+                    ServerErrorCode::InvalidConfig,
+                    "proxy_ssl_trusted_certificate '{}' contains no certificates",
+                    trusted_certificate
+                ));
+            }
+
+            let mut roots = RootCertStore::empty();
+            for certificate in certificates {
+                roots.add(certificate).map_err(|e| {
+                    server_err!(
+                        ServerErrorCode::InvalidConfig,
+                        "invalid certificate in proxy_ssl_trusted_certificate '{}': {}",
+                        trusted_certificate,
+                        e
+                    )
+                })?;
+            }
+            let inner =
+                WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider.clone())
+                    .build()
+                    .map_err(|e| {
+                        server_err!(
+                            ServerErrorCode::InvalidConfig,
+                            "failed to build upstream certificate verifier: {}",
+                            e
+                        )
+                    })?;
+            Arc::new(DepthLimitedServerCertVerifier {
+                inner,
+                max_intermediates: verify_depth,
+            })
+        } else {
+            Arc::new(NoCertificateVerifier::new(
+                provider.signature_verification_algorithms,
+            ))
+        };
+
+        let config = RustlsClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .map_err(|e| server_err!(ServerErrorCode::InvalidConfig, "Invalid tls config: {}", e))?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        Ok(Arc::new(config))
     }
 
     fn inject_forward_headers(header: &mut http::HeaderMap, info: &StreamInfo) {
@@ -830,6 +1584,7 @@ impl ProcessChainHttpServer {
             "trailer",
             "transfer-encoding",
             "upgrade",
+            "proxy-connection",
         ] {
             header.remove(name);
         }
@@ -840,14 +1595,194 @@ impl ProcessChainHttpServer {
         resp
     }
 
+    fn classify_pooled_acquire_error(err: &SfoHttpClientError) -> PooledAcquireFailure {
+        match err {
+            SfoHttpClientError::Connect(io_err) => io_err
+                .get_ref()
+                .and_then(|inner| inner.downcast_ref::<PooledUpstreamConnectorError>())
+                .map(|inner| PooledAcquireFailure::Connector(inner.reason))
+                .unwrap_or(PooledAcquireFailure::Connector(
+                    TunnelFailureReason::TunnelOpen,
+                )),
+            SfoHttpClientError::Pool(_) => err
+                .connector_error()
+                .map(Self::classify_pooled_acquire_error)
+                .unwrap_or(PooledAcquireFailure::PoolInternal),
+            SfoHttpClientError::Hyper(_) | SfoHttpClientError::AlpnMismatch { .. } => {
+                PooledAcquireFailure::HttpHandshake
+            }
+            SfoHttpClientError::ConnectionClosed => PooledAcquireFailure::ConnectionClosed,
+            SfoHttpClientError::MissingScheme
+            | SfoHttpClientError::MissingAuthority
+            | SfoHttpClientError::InvalidAuthority
+            | SfoHttpClientError::InvalidUri
+            | SfoHttpClientError::UnsupportedScheme(_)
+            | SfoHttpClientError::HostMismatch { .. } => PooledAcquireFailure::RequestConfig,
+        }
+    }
+
     async fn handle_forward_upstream(
         &self,
         req: http::Request<UnsyncBoxBody<Bytes, ServerError>>,
-        target_url: &str,
+        target: ResolvedForwardTarget,
         info: &StreamInfo,
     ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
         let mut slot = Some(req);
-        self.forward_to_candidate(&mut slot, target_url, info).await
+        let pooled_http_client = target
+            .upstream_name
+            .as_ref()
+            .and_then(|name| self.pooled_http_clients.get(name));
+        self.forward_to_candidate(&mut slot, target.url.as_str(), info, pooled_http_client)
+            .await
+    }
+
+    fn resolve_forward_target(&self, target: &str) -> ServerResult<ResolvedForwardTarget> {
+        if Url::parse(target).is_ok() {
+            return Ok(ResolvedForwardTarget {
+                url: target.to_string(),
+                upstream_name: None,
+            });
+        }
+        let upstream = self.upstreams.get(target).ok_or_else(|| {
+            server_err!(
+                ServerErrorCode::InvalidConfig,
+                "forward target '{}' is neither a valid URL nor a known upstream in http server '{}'",
+                target,
+                self.id
+            )
+        })?;
+        Ok(ResolvedForwardTarget {
+            url: upstream.url.clone(),
+            upstream_name: Some(target.to_string()),
+        })
+    }
+
+    fn resolve_forward_plan_upstreams(&self, plan: &ForwardPlan) -> ServerResult<ForwardPlan> {
+        let mut resolved = plan.clone();
+        for candidate in &mut resolved.candidates {
+            candidate.url = self.resolve_forward_target(&candidate.url)?.url;
+        }
+        for server in &mut resolved.servers {
+            for route in &mut server.routes {
+                route.url = self.resolve_forward_target(&route.url)?.url;
+            }
+        }
+        Ok(resolved)
+    }
+
+    async fn forward_to_pooled_http_candidate(
+        &self,
+        req_slot: &mut Option<http::Request<UnsyncBoxBody<Bytes, ServerError>>>,
+        pooled_http_client: &PooledHttpClient,
+        request_uri: &str,
+        history_key: Option<&Url>,
+        mut header: http::HeaderMap,
+        method: http::Method,
+        version: http::Version,
+    ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
+        // Acquire before taking the body so connector/pool failures remain
+        // eligible for the gateway's next-upstream policy.
+        let send_stream = match timeout(
+            self.forward_timeouts.request_timeout,
+            pooled_http_client.client.acquire_stream(),
+        )
+        .await
+        {
+            Err(_) => {
+                return Err(Self::upstream_timeout(
+                    "pool acquire",
+                    &pooled_http_client.target_url,
+                ));
+            }
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                let failure = Self::classify_pooled_acquire_error(&e);
+                let history_reason = match &failure {
+                    PooledAcquireFailure::Connector(reason) => Some(*reason),
+                    PooledAcquireFailure::HttpHandshake => Some(TunnelFailureReason::TunnelOpen),
+                    PooledAcquireFailure::PoolInternal
+                    | PooledAcquireFailure::ConnectionClosed
+                    | PooledAcquireFailure::RequestConfig => None,
+                };
+                if matches!(pooled_http_client.target_url.scheme(), "http" | "https")
+                    && let Some(key) = history_key
+                    && let Some(reason) = history_reason
+                {
+                    let detail = e.to_string();
+                    self.tunnel_manager
+                        .record_business_failure(key, reason, Some(&detail))
+                        .await;
+                }
+                let error_code = match failure {
+                    PooledAcquireFailure::Connector(_) => {
+                        if matches!(pooled_http_client.target_url.scheme(), "http" | "https") {
+                            ServerErrorCode::InvalidConfig
+                        } else {
+                            ServerErrorCode::TunnelError
+                        }
+                    }
+                    PooledAcquireFailure::RequestConfig => ServerErrorCode::InvalidConfig,
+                    PooledAcquireFailure::HttpHandshake
+                    | PooledAcquireFailure::PoolInternal
+                    | PooledAcquireFailure::ConnectionClosed => ServerErrorCode::StreamError,
+                };
+                return Err(server_err!(
+                    error_code,
+                    "Failed to acquire pooled upstream connection: {}",
+                    e
+                ));
+            }
+        };
+
+        let req = req_slot
+            .take()
+            .expect("forward_to_pooled_http_candidate: req_slot drained mid-flight");
+        let body = req.into_body();
+        let scheme = pooled_http_client.target_url.scheme();
+        let upstream_version = Self::upstream_http_version(scheme, version);
+        let mut upstream_req = Request::builder()
+            .method(method)
+            .uri(request_uri)
+            .version(upstream_version)
+            .body(body)
+            .map_err(|e| {
+                let error_code = Self::upstream_request_build_error_code(scheme);
+                server_err!(error_code, "Failed to build pooled upstream request: {}", e)
+            })?;
+        *upstream_req.headers_mut() = std::mem::take(&mut header);
+
+        let resp = match timeout(
+            self.forward_timeouts
+                .response_header_timeout
+                .min(self.forward_timeouts.request_timeout),
+            send_stream.send_request(upstream_req),
+        )
+        .await
+        {
+            Err(_) => {
+                return Err(Self::upstream_timeout(
+                    "response header",
+                    &pooled_http_client.target_url,
+                ));
+            }
+            Ok(Ok(resp)) => resp,
+            Ok(Err(e)) => {
+                // Match direct forwarding: after the connection is
+                // established, a send failure evicts this pooled connection
+                // but does not mark the upstream URL unreachable.
+                let error_code = Self::upstream_send_error_code(scheme);
+                return Err(server_err!(
+                    error_code,
+                    "Failed to request pooled upstream: {}",
+                    e
+                ));
+            }
+        };
+        let resp = Self::strip_forward_response_headers(resp);
+        let resp = resp.map(|body| {
+            Self::wrap_upstream_body(body, self.forward_timeouts.response_body_idle_timeout, None)
+        });
+        Ok(resp)
     }
 
     /// Forward the request held by `req_slot` to `target_url`.
@@ -867,70 +1802,82 @@ impl ProcessChainHttpServer {
         req_slot: &mut Option<http::Request<UnsyncBoxBody<Bytes, ServerError>>>,
         target_url: &str,
         info: &StreamInfo,
+        pooled_http_client: Option<&PooledHttpClient>,
     ) -> ServerResult<http::Response<UnsyncBoxBody<Bytes, ServerError>>> {
-        let (org_url, mut header, method, version, host_header) = {
+        let (org_url, mut header, method, version, process_chain_overrode_host) = {
             let req_ref = req_slot
                 .as_ref()
                 .expect("forward_to_candidate: req_slot must be Some on entry");
             let mut h = req_ref.headers().clone();
             Self::inject_forward_headers(&mut h, info);
-            let host = req_ref
-                .headers()
-                .get("host")
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.to_string());
+            Self::strip_hop_by_hop_headers(&mut h);
             (
                 req_ref.uri().to_string(),
                 h,
                 req_ref.method().clone(),
                 req_ref.version(),
-                host,
+                Self::process_chain_overrode_host(req_ref),
             )
         };
         let timeouts = self.forward_timeouts.clone();
         Self::strip_hop_by_hop_headers(&mut header);
         let client_origin_uri = Self::origin_form_uri(org_url.as_str());
-        // Trim URL boundary slashes so we don't end up with "//" when target_url ends with '/'
-        // and the request path starts with '/'.
-        let raw_url = if target_url.ends_with('/') || client_origin_uri.starts_with('/') {
-            let base = target_url.trim_end_matches('/');
-            let path = client_origin_uri.trim_start_matches('/');
-            format!("{}/{}", base, path)
-        } else {
-            format!("{}{}", target_url, client_origin_uri)
-        };
-        let request_url = Url::parse(&raw_url).map_err(|e| {
+        let parsed_target = Url::parse(target_url).map_err(|e| {
             server_err!(
                 ServerErrorCode::InvalidConfig,
-                "Failed to parse request upstream url {}: {}",
-                raw_url,
+                "Failed to parse upstream url {}: {}",
+                target_url,
                 e
             )
         })?;
-        let upstream_origin_uri = Self::origin_form_uri(request_url.as_str());
-        debug!("handle_upstream url: {}", request_url);
+        let scheme = parsed_target.scheme();
+        Self::apply_default_proxy_host(&mut header, &parsed_target, process_chain_overrode_host)?;
+        let upstream_origin_uri = if matches!(scheme, "http" | "https") {
+            Self::proxy_pass_origin_uri(target_url, &parsed_target, &client_origin_uri)?
+        } else {
+            client_origin_uri.clone()
+        };
+        debug!(
+            "handle_upstream target: {}, request uri: {}",
+            parsed_target, upstream_origin_uri
+        );
         // Per §6.7 we report the outcome of every business attempt to
-        // tunnel_mgr against the *candidate* URL (target_url), not the
-        // joined request_url with the user's path. Otherwise every
-        // distinct path becomes a separate history entry. Skip writeback
-        // when the candidate URL fails to parse — that's a config error,
-        // not a reachability signal.
-        let history_key = Self::upstream_history_key(target_url);
-        let scheme = request_url.scheme();
+        // tunnel_mgr against the candidate URL, not a request URL carrying
+        // the user's path. Otherwise every distinct path becomes a separate
+        // history entry.
+        let history_key = Some(parsed_target.clone());
+        if let Some(pooled) = pooled_http_client {
+            let pooled_request_uri = if matches!(scheme, "http" | "https") {
+                upstream_origin_uri.as_str()
+            } else {
+                client_origin_uri.as_str()
+            };
+            return self
+                .forward_to_pooled_http_candidate(
+                    req_slot,
+                    pooled,
+                    pooled_request_uri,
+                    history_key.as_ref(),
+                    header,
+                    method,
+                    version,
+                )
+                .await;
+        }
         match scheme {
             "http" => {
-                let connect_host = request_url.host_str().ok_or_else(|| {
+                let connect_host = parsed_target.host_str().ok_or_else(|| {
                     server_err!(
                         ServerErrorCode::InvalidConfig,
                         "Missing upstream host in url: {}",
-                        request_url
+                        parsed_target
                     )
                 })?;
-                let connect_port = request_url.port_or_known_default().ok_or_else(|| {
+                let connect_port = parsed_target.port_or_known_default().ok_or_else(|| {
                     server_err!(
                         ServerErrorCode::InvalidConfig,
                         "Missing upstream port in url: {}",
-                        request_url
+                        parsed_target
                     )
                 })?;
 
@@ -1013,8 +1960,6 @@ impl ProcessChainHttpServer {
                     }
                 });
 
-                let _ = version;
-                let _ = host_header;
                 // Connection up — taking the body now is the
                 // commitment point. Any subsequent failure is
                 // post-body and non-retryable.
@@ -1028,6 +1973,7 @@ impl ProcessChainHttpServer {
                 let mut upstream_req = Request::builder()
                     .method(method)
                     .uri(upstream_origin_uri.as_str())
+                    .version(Self::upstream_http_version(scheme, version))
                     .body(body)
                     .map_err(|e| {
                         server_err!(
@@ -1045,12 +1991,12 @@ impl ProcessChainHttpServer {
                     sender.send_request(upstream_req),
                 )
                 .await
-                .map_err(|_| Self::upstream_timeout("response header", &request_url))?
+                .map_err(|_| Self::upstream_timeout("response header", &parsed_target))?
                 .map_err(|e| {
                     server_err!(
                         ServerErrorCode::InvalidConfig,
                         "Failed to request upstream {}: {}",
-                        request_url,
+                        parsed_target,
                         e
                     )
                 })?;
@@ -1061,29 +2007,25 @@ impl ProcessChainHttpServer {
                 Ok(resp)
             }
             "https" => {
-                let upstream_http_version = match version {
-                    http::Version::HTTP_10 => http::Version::HTTP_10,
-                    http::Version::HTTP_11 => http::Version::HTTP_11,
-                    _ => http::Version::HTTP_11,
-                };
+                let upstream_http_version = Self::upstream_http_version(scheme, version);
 
-                let connect_host = request_url.host_str().ok_or_else(|| {
+                let connect_host = parsed_target.host_str().ok_or_else(|| {
                     server_err!(
                         ServerErrorCode::InvalidConfig,
                         "Missing upstream host in url: {}",
-                        request_url
+                        parsed_target
                     )
                 })?;
-                let connect_port = request_url.port_or_known_default().ok_or_else(|| {
+                let connect_port = parsed_target.port_or_known_default().ok_or_else(|| {
                     server_err!(
                         ServerErrorCode::InvalidConfig,
                         "Missing upstream port in url: {}",
-                        request_url
+                        parsed_target
                     )
                 })?;
 
                 // SNI must target the upstream host, not the inbound Host header.
-                let sni_host = Self::upstream_sni_host(&request_url)?;
+                let sni_host = Self::upstream_sni_host(&parsed_target)?;
 
                 // Wall-clock timer for "connection establishment" — TCP
                 // connect through hyper handshake. send_request /
@@ -1114,17 +2056,7 @@ impl ProcessChainHttpServer {
                         }
                     };
 
-                let tls_config = ClientConfig::builder_with_provider(Arc::new(
-                    rustls::crypto::ring::default_provider(),
-                ))
-                .with_safe_default_protocol_versions()
-                .map_err(|e| {
-                    server_err!(ServerErrorCode::InvalidConfig, "Invalid tls config: {}", e)
-                })?
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(NoCertificateVerifier))
-                .with_no_client_auth();
-                let tls_connector = TlsConnector::from(Arc::new(tls_config));
+                let tls_connector = TlsConnector::from(self.upstream_tls_config.clone());
                 let server_name = ServerName::try_from(sni_host.clone()).map_err(|e| {
                     server_err!(
                         ServerErrorCode::InvalidConfig,
@@ -1228,7 +2160,6 @@ impl ProcessChainHttpServer {
                     }
                 }));
 
-                let _ = host_header;
                 let req = req_slot
                     .take()
                     .expect("forward_to_candidate: req_slot drained mid-flight");
@@ -1345,7 +2276,6 @@ impl ProcessChainHttpServer {
                     }
                 });
 
-                let _ = version;
                 let req = req_slot
                     .take()
                     .expect("forward_to_candidate: req_slot drained mid-flight");
@@ -1356,6 +2286,7 @@ impl ProcessChainHttpServer {
                 let mut upstream_req = Request::builder()
                     .method(method)
                     .uri(client_origin_uri.as_str())
+                    .version(Self::upstream_http_version(scheme, version))
                     .body(body)
                     .map_err(|e| {
                         server_err!(
@@ -1507,7 +2438,7 @@ impl ProcessChainHttpServer {
                 }
             }
 
-            let attempt_fut = self.forward_to_candidate(&mut req_slot, &candidate.url, info);
+            let attempt_fut = self.forward_to_candidate(&mut req_slot, &candidate.url, info, None);
             let (attempt_res, attempt_cond) = match deadline {
                 Some(d) => {
                     let remaining = d.saturating_duration_since(std::time::Instant::now());
@@ -1650,7 +2581,7 @@ impl ProcessChainHttpServer {
             Self::set_content_length(&mut attempt_req);
             let mut req_slot = Some(attempt_req);
 
-            let attempt_fut = self.forward_to_candidate(&mut req_slot, &candidate.url, info);
+            let attempt_fut = self.forward_to_candidate(&mut req_slot, &candidate.url, info, None);
             let (attempt_res, attempt_cond) = match deadline {
                 Some(d) => {
                     let remaining = d.saturating_duration_since(std::time::Instant::now());
@@ -1738,22 +2669,38 @@ impl ProcessChainHttpServer {
     /// if it exceeded the cap (in which case retry is no longer safe
     /// for this request).
     async fn buffer_body(
-        body: UnsyncBoxBody<Bytes, ServerError>,
+        mut body: UnsyncBoxBody<Bytes, ServerError>,
         cap: u64,
     ) -> ServerResult<Option<Bytes>> {
-        let cap = cap as usize;
-        let collected = body.collect().await.map_err(|e| {
-            server_err!(
-                ServerErrorCode::StreamError,
-                "buffering request body failed: {:?}",
-                e
-            )
-        })?;
-        let bytes = collected.to_bytes();
-        if bytes.len() > cap {
-            return Ok(None);
+        let mut buffered = Vec::new();
+        let mut total = 0u64;
+
+        while let Some(frame) = body.frame().await {
+            let frame = frame.map_err(|e| {
+                server_err!(
+                    ServerErrorCode::StreamError,
+                    "buffering request body failed: {:?}",
+                    e
+                )
+            })?;
+            let Ok(data) = frame.into_data() else {
+                // Match the previous `Collected::to_bytes` behavior: only
+                // data frames participate in the replay buffer.
+                continue;
+            };
+            let data_len = u64::try_from(data.len()).unwrap_or(u64::MAX);
+            let Some(next_total) = total.checked_add(data_len) else {
+                return Ok(None);
+            };
+            if next_total > cap {
+                return Ok(None);
+            }
+
+            buffered.extend_from_slice(&data);
+            total = next_total;
         }
-        Ok(Some(bytes))
+
+        Ok(Some(Bytes::from(buffered)))
     }
 
     fn full_body(bytes: Bytes) -> UnsyncBoxBody<Bytes, ServerError> {
@@ -2075,7 +3022,6 @@ impl HttpServer for ProcessChainHttpServer {
                     .await;
             }
         };
-
         // Capture request meta early so we can log it even if the process chain
         // decides to drop/reject without forwarding the request.
         let req_method = req.method().to_string();
@@ -2287,13 +3233,11 @@ impl HttpServer for ProcessChainHttpServer {
                                     "invalid forward command"
                                 ));
                             }
-                            let target_url = list[1].as_str();
+                            let target = self.resolve_forward_target(list[1].as_str())?;
                             let post_req = req_map.into_request().map_err(|e| {
                                 server_err!(ServerErrorCode::ProcessChainError, "{}", e)
                             })?;
-                            let resp = self
-                                .handle_forward_upstream(post_req, target_url, &info)
-                                .await;
+                            let resp = self.handle_forward_upstream(post_req, target, &info).await;
                             return self
                                 .apply_post_chain_result(
                                     resp,
@@ -2317,6 +3261,7 @@ impl HttpServer for ProcessChainHttpServer {
                                     e
                                 )
                             })?;
+                            let plan = self.resolve_forward_plan_upstreams(&plan)?;
                             let post_req = req_map.into_request().map_err(|e| {
                                 server_err!(ServerErrorCode::ProcessChainError, "{}", e)
                             })?;
@@ -2484,6 +3429,41 @@ pub struct ForwardUpstreamTimeoutConfig {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct HttpNamedUpstreamConfig {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive: Option<HttpKeepaliveConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_timeout: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keepalive_requests: Option<u64>,
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum HttpKeepaliveConfig {
+    Enabled(bool),
+    Count(usize),
+}
+
+fn default_upstream_keepalive() -> usize {
+    32
+}
+
+fn default_upstream_keepalive_timeout() -> Duration {
+    Duration::from_secs(60)
+}
+
+fn default_upstream_keepalive_requests() -> u64 {
+    1000
+}
+
+fn default_proxy_ssl_verify_depth() -> usize {
+    1
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub struct ProcessChainHttpServerConfig {
     pub id: String,
     #[serde(rename = "type")]
@@ -2502,6 +3482,12 @@ pub struct ProcessChainHttpServerConfig {
     /// from any peer are treated as plain input data.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trusted_upstreams: Vec<String>,
+    #[serde(default)]
+    pub proxy_ssl_verify: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxy_ssl_trusted_certificate: Option<String>,
+    #[serde(default = "default_proxy_ssl_verify_depth")]
+    pub proxy_ssl_verify_depth: usize,
     #[serde(default)]
     pub gzip: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -2526,6 +3512,8 @@ pub struct ProcessChainHttpServerConfig {
     pub brotli_min_length: u64,
     #[serde(default = "default_brotli_comp_level")]
     pub brotli_comp_level: u32,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub upstreams: HashMap<String, HttpNamedUpstreamConfig>,
 }
 
 impl ServerConfig for ProcessChainHttpServerConfig {
@@ -2621,6 +3609,12 @@ impl ServerFactory for ProcessChainHttpServerFactory {
             .trusted_upstreams(config.trusted_upstreams.clone());
         let compression = ProcessChainHttpServerBuilder::build_compression_settings(config)?;
         builder = builder.compression(compression);
+        let upstream_tls_config = ProcessChainHttpServer::build_upstream_tls_config(
+            config.proxy_ssl_verify,
+            config.proxy_ssl_trusted_certificate.as_deref(),
+            config.proxy_ssl_verify_depth,
+        )?;
+        builder = builder.upstream_tls_config(upstream_tls_config);
         if config.h3_port.is_some() {
             builder = builder.h3_port(config.h3_port.clone().unwrap());
         }
@@ -2630,6 +3624,9 @@ impl ServerFactory for ProcessChainHttpServerFactory {
         builder = builder.forward_timeouts(ForwardUpstreamTimeouts::from_config(
             config.forward.as_ref(),
         ));
+        builder = builder.upstreams(ProcessChainHttpServerBuilder::build_named_upstreams(
+            config,
+        )?);
         if let Some(post_hook_point) = config.post_hook_point.as_ref() {
             builder = builder.post_hook_point(post_hook_point.clone());
         }
@@ -2647,11 +3644,20 @@ mod tests {
     };
     use async_compression::tokio::bufread::{BrotliDecoder, GzipDecoder, GzipEncoder};
     use buckyos_kit::init_logging;
+    use http_body_util::StreamBody;
+    use hyper::body::Frame;
     use hyper_util::rt::{TokioExecutor, TokioIo};
     use std::collections::VecDeque;
     use std::io::Cursor;
     use std::sync::Arc;
-    use tokio::io::AsyncReadExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn framed_body(
+        frames: Vec<Result<Frame<Bytes>, ServerError>>,
+    ) -> UnsyncBoxBody<Bytes, ServerError> {
+        StreamBody::new(futures::stream::iter(frames)).boxed_unsync()
+    }
 
     struct PendingBody;
 
@@ -3182,6 +4188,161 @@ mod tests {
             ProcessChainHttpServer::origin_form_uri("/kapi/klog-service"),
             "/kapi/klog-service"
         );
+    }
+
+    #[test]
+    fn test_proxy_ssl_config_defaults_match_nginx() {
+        let config: ProcessChainHttpServerConfig = serde_yaml_ng::from_str(
+            r#"
+id: test
+type: http
+hook_point: []
+"#,
+        )
+        .unwrap();
+
+        assert!(!config.proxy_ssl_verify);
+        assert!(config.proxy_ssl_trusted_certificate.is_none());
+        assert_eq!(config.proxy_ssl_verify_depth, 1);
+    }
+
+    #[test]
+    fn test_proxy_pass_without_uri_preserves_inbound_uri() {
+        let target = Url::parse("http://backend.example").unwrap();
+        assert_eq!(
+            ProcessChainHttpServer::proxy_pass_origin_uri(
+                "http://backend.example",
+                &target,
+                "/users?id=7",
+            )
+            .unwrap(),
+            "/users?id=7"
+        );
+    }
+
+    #[test]
+    fn test_proxy_pass_uri_replaces_implicit_location_prefix() {
+        let trailing_slash = Url::parse("http://backend.example/api/").unwrap();
+        assert_eq!(
+            ProcessChainHttpServer::proxy_pass_origin_uri(
+                "http://backend.example/api/",
+                &trailing_slash,
+                "/users?id=7",
+            )
+            .unwrap(),
+            "/api/users?id=7"
+        );
+
+        let no_trailing_slash = Url::parse("http://backend.example/api").unwrap();
+        assert_eq!(
+            ProcessChainHttpServer::proxy_pass_origin_uri(
+                "http://backend.example/api",
+                &no_trailing_slash,
+                "/users?id=7",
+            )
+            .unwrap(),
+            "/apiusers?id=7"
+        );
+    }
+
+    #[test]
+    fn test_proxy_pass_configured_query_replaces_inbound_query() {
+        let target = Url::parse("http://backend.example/api/?token=fixed").unwrap();
+        assert_eq!(
+            ProcessChainHttpServer::proxy_pass_origin_uri(
+                "http://backend.example/api/?token=fixed",
+                &target,
+                "/users?id=7",
+            )
+            .unwrap(),
+            "/api/users?token=fixed"
+        );
+    }
+
+    #[test]
+    fn test_proxy_pass_rejects_http_url_fragment() {
+        let target = Url::parse("http://backend.example/api/#section").unwrap();
+        let error = ProcessChainHttpServer::proxy_pass_origin_uri(
+            "http://backend.example/api/#section",
+            &target,
+            "/users",
+        )
+        .unwrap_err();
+        assert_eq!(error.code(), ServerErrorCode::InvalidConfig);
+    }
+
+    #[tokio::test]
+    async fn test_buffer_body_accepts_multiple_frames_at_exact_cap() {
+        let body = framed_body(vec![
+            Ok(Frame::data(Bytes::from_static(b"abc"))),
+            Ok(Frame::data(Bytes::from_static(b"def"))),
+        ]);
+
+        let buffered = ProcessChainHttpServer::buffer_body(body, 6)
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(buffered, Bytes::from_static(b"abcdef"));
+    }
+
+    #[tokio::test]
+    async fn test_buffer_body_rejects_later_frame_over_cap() {
+        let body = framed_body(vec![
+            Ok(Frame::data(Bytes::from_static(b"abc"))),
+            Ok(Frame::data(Bytes::from_static(b"defg"))),
+        ]);
+
+        let buffered = ProcessChainHttpServer::buffer_body(body, 6).await.unwrap();
+
+        assert!(buffered.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_buffer_body_stops_polling_after_first_oversized_frame() {
+        let body = framed_body(vec![
+            Ok(Frame::data(Bytes::from_static(b"oversized"))),
+            Err(ServerError::new(
+                ServerErrorCode::StreamError,
+                "must not be polled".to_string(),
+            )),
+        ]);
+
+        let buffered = ProcessChainHttpServer::buffer_body(body, 4).await.unwrap();
+
+        assert!(buffered.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_buffer_body_zero_cap_accepts_only_empty_body() {
+        let empty = ProcessChainHttpServer::buffer_body(framed_body(Vec::new()), 0)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(empty.is_empty());
+
+        let non_empty = framed_body(vec![Ok(Frame::data(Bytes::from_static(b"x")))]);
+        assert!(
+            ProcessChainHttpServer::buffer_body(non_empty, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_buffer_body_maps_body_error_to_stream_error() {
+        let body = framed_body(vec![Err(ServerError::new(
+            ServerErrorCode::BadRequest,
+            "broken body".to_string(),
+        ))]);
+
+        let error = ProcessChainHttpServer::buffer_body(body, 16)
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code(), ServerErrorCode::StreamError);
+        assert!(error.msg().contains("buffering request body failed"));
     }
 
     #[tokio::test]
@@ -5014,9 +6175,10 @@ forward:
             .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
         let target_url = format!("http://{}", listen_addr);
+        let target = http_server.resolve_forward_target(&target_url).unwrap();
 
         let err = http_server
-            .handle_forward_upstream(request, &target_url, &StreamInfo::default())
+            .handle_forward_upstream(request, target, &StreamInfo::default())
             .await
             .unwrap_err();
 
@@ -5046,9 +6208,10 @@ forward:
             .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed_unsync())
             .unwrap();
         let target_url = format!("https://{}", listen_addr);
+        let target = http_server.resolve_forward_target(&target_url).unwrap();
 
         let err = http_server
-            .handle_forward_upstream(request, &target_url, &StreamInfo::default())
+            .handle_forward_upstream(request, target, &StreamInfo::default())
             .await
             .unwrap_err();
 
@@ -5132,6 +6295,34 @@ function slow_post(context) {
         let sni_host = ProcessChainHttpServer::upstream_sni_host(&request_url).unwrap();
         assert_ne!(sni_host, "sn.buckyos.ai");
         assert_eq!(sni_host, "inuy7.tbudr.top");
+    }
+
+    #[test]
+    fn test_pooled_upstream_protocol_and_error_codes_match_direct_branches() {
+        assert_eq!(
+            ProcessChainHttpServer::upstream_http_version("http", Version::HTTP_10),
+            Version::HTTP_11
+        );
+        assert_eq!(
+            ProcessChainHttpServer::upstream_http_version("tcp", Version::HTTP_10),
+            Version::HTTP_11
+        );
+        assert_eq!(
+            ProcessChainHttpServer::upstream_http_version("https", Version::HTTP_10),
+            Version::HTTP_10
+        );
+        assert_eq!(
+            ProcessChainHttpServer::upstream_send_error_code("http"),
+            ServerErrorCode::InvalidConfig
+        );
+        assert_eq!(
+            ProcessChainHttpServer::upstream_send_error_code("https"),
+            ServerErrorCode::InvalidConfig
+        );
+        assert_eq!(
+            ProcessChainHttpServer::upstream_send_error_code("tcp"),
+            ServerErrorCode::TunnelError
+        );
     }
 
     #[tokio::test]
@@ -5504,9 +6695,10 @@ function slow_post(context) {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    #[tokio::test]
-    async fn test_factory() {
-        let config = ProcessChainHttpServerConfig {
+    fn test_http_config_with_upstreams(
+        upstreams: HashMap<String, HttpNamedUpstreamConfig>,
+    ) -> ProcessChainHttpServerConfig {
+        ProcessChainHttpServerConfig {
             id: "test".to_string(),
             ty: "http".to_string(),
             version: None,
@@ -5515,6 +6707,9 @@ function slow_post(context) {
             post_hook_point: None,
             forward: None,
             trusted_upstreams: Vec::new(),
+            proxy_ssl_verify: false,
+            proxy_ssl_trusted_certificate: None,
+            proxy_ssl_verify_depth: default_proxy_ssl_verify_depth(),
             gzip: false,
             gzip_types: Vec::new(),
             gzip_min_length: default_gzip_min_length(),
@@ -5527,6 +6722,1383 @@ function slow_post(context) {
             brotli_types: Vec::new(),
             brotli_min_length: default_brotli_min_length(),
             brotli_comp_level: default_brotli_comp_level(),
+            upstreams,
+        }
+    }
+
+    async fn test_http_server_for_pooled_forward() -> ProcessChainHttpServer {
+        let server_mgr = Arc::new(ServerManager::new());
+        ProcessChainHttpServer::builder()
+            .id("test_pooled_forward")
+            .version("HTTP/1.1".to_string())
+            .hook_point(ProcessChainConfigs::default())
+            .server_mgr(Arc::downgrade(&server_mgr))
+            .tunnel_manager(TunnelManager::new())
+            .build()
+            .await
+            .unwrap()
+    }
+
+    async fn spawn_counting_http_upstream() -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_server = accepted.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                accepted_server.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        |req: http::Request<hyper::body::Incoming>| async move {
+                            let _ = req.collect().await;
+                            Ok::<_, ServerError>(
+                                http::Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(
+                                        Full::new(Bytes::from_static(b"ok"))
+                                            .map_err(|e| match e {})
+                                            .boxed(),
+                                    )
+                                    .unwrap(),
+                            )
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        (addr, accepted)
+    }
+
+    async fn spawn_host_recording_http_upstream() -> (SocketAddr, Arc<Mutex<Vec<String>>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen_hosts = Arc::new(Mutex::new(Vec::new()));
+        let seen_hosts_server = seen_hosts.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let seen_hosts = seen_hosts_server.clone();
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        move |req: http::Request<hyper::body::Incoming>| {
+                            let seen_hosts = seen_hosts.clone();
+                            async move {
+                                let host = req
+                                    .headers()
+                                    .get(http::header::HOST)
+                                    .and_then(|value| value.to_str().ok())
+                                    .unwrap_or("<missing>")
+                                    .to_string();
+                                seen_hosts.lock().unwrap().push(host);
+                                let _ = req.collect().await;
+                                Ok::<_, ServerError>(
+                                    http::Response::builder()
+                                        .status(StatusCode::OK)
+                                        .body(
+                                            Full::new(Bytes::from_static(b"ok"))
+                                                .map_err(|e| match e {})
+                                                .boxed(),
+                                        )
+                                        .unwrap(),
+                                )
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        (addr, seen_hosts)
+    }
+
+    async fn spawn_connection_close_http_upstream() -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_server = accepted.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                accepted_server.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(
+                        |req: http::Request<hyper::body::Incoming>| async move {
+                            let _ = req.collect().await;
+                            Ok::<_, ServerError>(
+                                http::Response::builder()
+                                    .status(StatusCode::OK)
+                                    .header(http::header::CONNECTION, "close")
+                                    .header(
+                                        http::HeaderName::from_static("keep-alive"),
+                                        "timeout=1",
+                                    )
+                                    .body(
+                                        Full::new(Bytes::from_static(b"ok"))
+                                            .map_err(|e| match e {})
+                                            .boxed(),
+                                    )
+                                    .unwrap(),
+                            )
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+
+        (addr, accepted)
+    }
+
+    async fn spawn_reused_connection_failure_http_upstream() -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_server = accepted.clone();
+
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            accepted_server.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 2048];
+            let _ = stream.read(&mut buf).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok",
+                )
+                .await
+                .unwrap();
+            let _ = stream.read(&mut buf).await;
+        });
+
+        (addr, accepted)
+    }
+
+    async fn build_test_pooled_client(
+        server: &ProcessChainHttpServer,
+        url: &str,
+        keepalive: usize,
+        keepalive_timeout: Duration,
+        keepalive_requests: u64,
+    ) -> PooledHttpClient {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "test".to_string(),
+            HttpNamedUpstream {
+                url: url.to_string(),
+                keepalive: Some(HttpKeepaliveSettings {
+                    keepalive,
+                    keepalive_timeout,
+                    keepalive_requests,
+                }),
+            },
+        );
+        ProcessChainHttpServer::build_pooled_http_clients(
+            &upstreams,
+            server.tunnel_manager.clone(),
+            server.upstream_tls_config.clone(),
+            server.forward_timeouts.clone(),
+        )
+        .await
+        .unwrap()
+        .remove("test")
+        .unwrap()
+    }
+
+    async fn send_test_pooled_request(
+        server: &ProcessChainHttpServer,
+        client: &PooledHttpClient,
+        uri: &str,
+    ) {
+        send_test_pooled_request_with_history(server, client, uri, None).await;
+    }
+
+    async fn send_test_pooled_request_with_history(
+        server: &ProcessChainHttpServer,
+        client: &PooledHttpClient,
+        uri: &str,
+        history_key: Option<&Url>,
+    ) {
+        let resp = start_test_pooled_request_with_history(server, client, uri, history_key).await;
+        let _ = resp.into_body().collect().await.unwrap();
+    }
+
+    async fn start_test_pooled_request(
+        server: &ProcessChainHttpServer,
+        client: &PooledHttpClient,
+        uri: &str,
+    ) -> http::Response<UnsyncBoxBody<Bytes, ServerError>> {
+        start_test_pooled_request_with_history(server, client, uri, None).await
+    }
+
+    async fn start_test_pooled_request_with_history(
+        server: &ProcessChainHttpServer,
+        client: &PooledHttpClient,
+        uri: &str,
+        history_key: Option<&Url>,
+    ) -> http::Response<UnsyncBoxBody<Bytes, ServerError>> {
+        let mut req_slot = Some(
+            Request::builder()
+                .method(http::Method::GET)
+                .uri(uri)
+                .body(
+                    Full::new(Bytes::new())
+                        .map_err(|e| match e {})
+                        .boxed_unsync(),
+                )
+                .unwrap(),
+        );
+        let request_url = Url::parse(uri).unwrap();
+        let resp = server
+            .forward_to_pooled_http_candidate(
+                &mut req_slot,
+                client,
+                ProcessChainHttpServer::origin_form_uri(request_url.as_str()).as_str(),
+                history_key,
+                http::HeaderMap::new(),
+                http::Method::GET,
+                http::Version::HTTP_11,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        resp
+    }
+
+    async fn test_process_chain_server_with_named_http_upstream_config(
+        upstream_config: HttpNamedUpstreamConfig,
+    ) -> (Arc<ProcessChainHttpServer>, Arc<ServerManager>) {
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        forward api_a;
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+        test_process_chain_server_with_named_http_upstream_config_and_chains(
+            upstream_config,
+            chains,
+        )
+        .await
+    }
+
+    async fn test_process_chain_server_with_named_http_upstream_config_and_chains(
+        upstream_config: HttpNamedUpstreamConfig,
+        chains: ProcessChainConfigs,
+    ) -> (Arc<ProcessChainHttpServer>, Arc<ServerManager>) {
+        let mut upstreams = HashMap::new();
+        upstreams.insert("api_a".to_string(), upstream_config);
+        let config = test_http_config_with_upstreams(upstreams);
+        let runtime_upstreams =
+            ProcessChainHttpServerBuilder::build_named_upstreams(&config).unwrap();
+        let server_mgr = Arc::new(ServerManager::new());
+
+        let http_server = Arc::new(
+            ProcessChainHttpServer::builder()
+                .id("test_named_http_keepalive")
+                .version("HTTP/1.1".to_string())
+                .hook_point(chains)
+                .server_mgr(Arc::downgrade(&server_mgr))
+                .tunnel_manager(TunnelManager::new())
+                .upstreams(runtime_upstreams)
+                .build()
+                .await
+                .unwrap(),
+        );
+        (http_server, server_mgr)
+    }
+
+    async fn test_process_chain_server_with_named_http_upstream(
+        upstream_url: String,
+        keepalive: HttpKeepaliveConfig,
+        keepalive_timeout: &str,
+        keepalive_requests: u64,
+    ) -> (Arc<ProcessChainHttpServer>, Arc<ServerManager>) {
+        test_process_chain_server_with_named_http_upstream_config(HttpNamedUpstreamConfig {
+            url: upstream_url,
+            keepalive: Some(keepalive),
+            keepalive_timeout: Some(keepalive_timeout.to_string()),
+            keepalive_requests: Some(keepalive_requests),
+        })
+        .await
+    }
+
+    async fn send_process_chain_request(
+        sender: &mut hyper::client::conn::http1::SendRequest<BoxBody<Bytes, ServerError>>,
+        path: &str,
+    ) {
+        send_process_chain_request_with_headers(sender, path, http::HeaderMap::new()).await;
+    }
+
+    async fn send_process_chain_request_with_headers(
+        sender: &mut hyper::client::conn::http1::SendRequest<BoxBody<Bytes, ServerError>>,
+        path: &str,
+        headers: http::HeaderMap,
+    ) {
+        let request = http::Request::builder()
+            .method("GET")
+            .uri(path)
+            .body(Full::new(Bytes::new()).map_err(|e| match e {}).boxed())
+            .unwrap();
+        let (mut parts, body) = request.into_parts();
+        parts.headers = headers;
+        let request = http::Request::from_parts(parts, body);
+        let resp = sender.send_request(request).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.collect().await.unwrap().to_bytes();
+        assert_eq!(body, Bytes::from_static(b"ok"));
+    }
+
+    async fn send_one_process_chain_request(
+        http_server: Arc<ProcessChainHttpServer>,
+        path: &str,
+        headers: http::HeaderMap,
+    ) {
+        let (client, server) = tokio::io::duplex(2048);
+        tokio::task::spawn_local(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = conn.await;
+        });
+
+        send_process_chain_request_with_headers(&mut sender, path, headers).await;
+    }
+
+    #[test]
+    fn test_proxy_host_formats_upstream_authority() {
+        let cases = [
+            ("http://example.com/path", "example.com"),
+            ("https://example.com:8443/path", "example.com:8443"),
+            ("http://[2001:db8::1]:8080/path", "[2001:db8::1]:8080"),
+        ];
+
+        for (url, expected) in cases {
+            let value =
+                ProcessChainHttpServer::upstream_host_header(&Url::parse(url).unwrap()).unwrap();
+            assert_eq!(value, expected);
+        }
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn test_proxy_host_defaults_to_upstream_authority_for_direct_and_pooled() {
+        for keepalive in [None, Some(HttpKeepaliveConfig::Count(1))] {
+            let (addr, seen_hosts) = spawn_host_recording_http_upstream().await;
+            let upstream_config = HttpNamedUpstreamConfig {
+                url: format!("http://{addr}"),
+                keepalive,
+                keepalive_timeout: None,
+                keepalive_requests: None,
+            };
+            let (http_server, _server_mgr) =
+                test_process_chain_server_with_named_http_upstream_config(upstream_config).await;
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::HOST,
+                http::HeaderValue::from_static("client.example"),
+            );
+
+            send_one_process_chain_request(http_server, "/proxy-host", headers).await;
+
+            assert_eq!(seen_hosts.lock().unwrap().as_slice(), &[addr.to_string()]);
+        }
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn test_proxy_host_process_chain_override_wins() {
+        let (addr, seen_hosts) = spawn_host_recording_http_upstream().await;
+        let upstream_config = HttpNamedUpstreamConfig {
+            url: format!("http://{addr}"),
+            keepalive: Some(HttpKeepaliveConfig::Count(1)),
+            keepalive_timeout: None,
+            keepalive_requests: None,
+        };
+        let chains = r#"
+- id: main
+  priority: 1
+  blocks:
+    - id: main
+      block: |
+        ${REQ.host} = chain.example;
+        forward api_a;
+        "#;
+        let chains: ProcessChainConfigs = serde_yaml_ng::from_str(chains).unwrap();
+        let (http_server, _server_mgr) =
+            test_process_chain_server_with_named_http_upstream_config_and_chains(
+                upstream_config,
+                chains,
+            )
+            .await;
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::HOST,
+            // Setting Host to the same value as the inbound header is still
+            // an explicit process-chain override and must beat the default.
+            http::HeaderValue::from_static("chain.example"),
+        );
+
+        send_one_process_chain_request(http_server, "/proxy-host-override", headers).await;
+
+        assert_eq!(
+            seen_hosts.lock().unwrap().as_slice(),
+            &["chain.example".to_string()]
+        );
+    }
+
+    #[test]
+    fn test_named_upstream_config_accepts_url_and_keepalive() {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "api_a".to_string(),
+            HttpNamedUpstreamConfig {
+                url: "http://api-a.internal:8080/".to_string(),
+                keepalive: Some(HttpKeepaliveConfig::Count(16)),
+                keepalive_timeout: Some("30s".to_string()),
+                keepalive_requests: Some(500),
+            },
+        );
+        let config = test_http_config_with_upstreams(upstreams);
+
+        let runtime = ProcessChainHttpServerBuilder::build_named_upstreams(&config).unwrap();
+        let upstream = runtime.get("api_a").unwrap();
+
+        assert_eq!(upstream.url, "http://api-a.internal:8080/");
+        let keepalive = upstream.keepalive.as_ref().unwrap();
+        assert_eq!(keepalive.keepalive, 16);
+        assert_eq!(keepalive.keepalive_timeout, Duration::from_secs(30));
+        assert_eq!(keepalive.keepalive_requests, 500);
+    }
+
+    #[test]
+    fn test_named_upstream_config_rejects_names_that_can_be_urls_or_need_normalization() {
+        let mut invalid_names = vec![
+            "".to_string(),
+            " api".to_string(),
+            "api ".to_string(),
+            "1api".to_string(),
+            "api.example".to_string(),
+            "api/name".to_string(),
+            "foo:bar".to_string(),
+            "中文".to_string(),
+        ];
+        invalid_names.push(format!("a{}", "b".repeat(64)));
+
+        for name in invalid_names {
+            let mut upstreams = HashMap::new();
+            upstreams.insert(
+                name.clone(),
+                HttpNamedUpstreamConfig {
+                    url: "http://api-a.internal:8080/".to_string(),
+                    keepalive: None,
+                    keepalive_timeout: None,
+                    keepalive_requests: None,
+                },
+            );
+            let config = test_http_config_with_upstreams(upstreams);
+
+            let err = ProcessChainHttpServerBuilder::build_named_upstreams(&config).unwrap_err();
+            assert!(
+                err.msg().contains("expected ^[A-Za-z_][A-Za-z0-9_-]"),
+                "unexpected error for upstream name {:?}: {}",
+                name,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn test_named_upstream_config_accepts_identifier_names() {
+        for name in ["api", "api_a", "api-a", "_internal", "Api2"] {
+            let mut upstreams = HashMap::new();
+            upstreams.insert(
+                name.to_string(),
+                HttpNamedUpstreamConfig {
+                    url: "http://api-a.internal:8080/".to_string(),
+                    keepalive: None,
+                    keepalive_timeout: None,
+                    keepalive_requests: None,
+                },
+            );
+            let config = test_http_config_with_upstreams(upstreams);
+
+            let runtime = ProcessChainHttpServerBuilder::build_named_upstreams(&config).unwrap();
+            assert!(runtime.contains_key(name));
+            assert!(Url::parse(name).is_err());
+        }
+    }
+
+    #[test]
+    fn test_named_upstream_config_rejects_keepalive_zero() {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "api_a".to_string(),
+            HttpNamedUpstreamConfig {
+                url: "http://api-a.internal:8080/".to_string(),
+                keepalive: Some(HttpKeepaliveConfig::Count(0)),
+                keepalive_timeout: None,
+                keepalive_requests: None,
+            },
+        );
+        let config = test_http_config_with_upstreams(upstreams);
+
+        let err = ProcessChainHttpServerBuilder::build_named_upstreams(&config).unwrap_err();
+        assert!(err.msg().contains("keepalive must be greater than 0"));
+    }
+
+    #[test]
+    fn test_named_upstream_config_rejects_keepalive_above_pool_capacity() {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "api_a".to_string(),
+            HttpNamedUpstreamConfig {
+                url: "tcp:///127.0.0.1:8080".to_string(),
+                keepalive: Some(HttpKeepaliveConfig::Count(u16::MAX as usize + 1)),
+                keepalive_timeout: None,
+                keepalive_requests: None,
+            },
+        );
+        let config = test_http_config_with_upstreams(upstreams);
+
+        let err = ProcessChainHttpServerBuilder::build_named_upstreams(&config).unwrap_err();
+        assert!(err.msg().contains("keepalive must not exceed"));
+    }
+
+    #[tokio::test]
+    async fn test_pooled_http_keepalive_reuses_connection() {
+        let server = test_http_server_for_pooled_forward().await;
+        let (addr, accepted) = spawn_counting_http_upstream().await;
+        let uri = format!("http://127.0.0.1:{}/reuse", addr.port());
+        let client = build_test_pooled_client(&server, &uri, 1, Duration::from_secs(30), 100).await;
+
+        send_test_pooled_request(&server, &client, &uri).await;
+        send_test_pooled_request(&server, &client, &uri).await;
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_pooled_http_keepalive_limits_idle_not_active_connections() {
+        let server = test_http_server_for_pooled_forward().await;
+        let (addr, accepted) = spawn_counting_http_upstream().await;
+        let uri = format!("http://127.0.0.1:{}/idle-not-active", addr.port());
+        let client = build_test_pooled_client(&server, &uri, 1, Duration::from_secs(30), 100).await;
+
+        let first = start_test_pooled_request(&server, &client, &uri).await;
+        let second = tokio::time::timeout(
+            Duration::from_secs(1),
+            start_test_pooled_request(&server, &client, &uri),
+        )
+        .await
+        .expect("keepalive idle limit must not block another active connection");
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+
+        let _ = first.into_body().collect().await.unwrap();
+        let _ = second.into_body().collect().await.unwrap();
+
+        send_test_pooled_request(&server, &client, &uri).await;
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            2,
+            "one of the completed connections should remain in the idle cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pooled_http_keepalive_records_new_connection_rtt_once() {
+        let server = test_http_server_for_pooled_forward().await;
+        let (addr, accepted) = spawn_counting_http_upstream().await;
+        let uri = format!("http://127.0.0.1:{}/reuse-rtt", addr.port());
+        let client = build_test_pooled_client(&server, &uri, 1, Duration::from_secs(30), 100).await;
+        let history_key = Url::parse(&uri).unwrap();
+
+        send_test_pooled_request_with_history(&server, &client, &uri, Some(&history_key)).await;
+        send_test_pooled_request_with_history(&server, &client, &uri, Some(&history_key)).await;
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        let history = server.tunnel_manager.list_tunnel_url_history().await;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].success_count, 1);
+        assert_eq!(history[0].recent_rtt_ms.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_pooled_http_keepalive_requests_replaces_connection_at_limit() {
+        let server = test_http_server_for_pooled_forward().await;
+        let (addr, accepted) = spawn_counting_http_upstream().await;
+        let uri = format!("http://127.0.0.1:{}/request-limit", addr.port());
+        let client = build_test_pooled_client(&server, &uri, 1, Duration::from_secs(30), 1).await;
+
+        send_test_pooled_request(&server, &client, &uri).await;
+        send_test_pooled_request(&server, &client, &uri).await;
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn test_pooled_http_keepalive_timeout_expires_idle_connection() {
+        let server = test_http_server_for_pooled_forward().await;
+        let (addr, accepted) = spawn_counting_http_upstream().await;
+        let uri = format!("http://127.0.0.1:{}/idle-timeout", addr.port());
+        let client =
+            build_test_pooled_client(&server, &uri, 1, Duration::from_millis(50), 100).await;
+
+        send_test_pooled_request(&server, &client, &uri).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        send_test_pooled_request(&server, &client, &uri).await;
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn test_process_chain_http_server_named_http_keepalive_reuses_connection() {
+        let (addr, accepted) = spawn_counting_http_upstream().await;
+        let (http_server, _server_mgr) = test_process_chain_server_with_named_http_upstream(
+            format!("http://127.0.0.1:{}/", addr.port()),
+            HttpKeepaliveConfig::Count(1),
+            "30s",
+            100,
+        )
+        .await;
+
+        let (client, server) = tokio::io::duplex(2048);
+        tokio::task::spawn_local(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        send_process_chain_request(&mut sender, "/reuse-a").await;
+        send_process_chain_request(&mut sender, "/reuse-b").await;
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn test_process_chain_http_server_named_tcp_keepalive_reuses_connection() {
+        let (addr, accepted) = spawn_counting_http_upstream().await;
+        let (http_server, _server_mgr) = test_process_chain_server_with_named_http_upstream(
+            format!("tcp:///127.0.0.1:{}", addr.port()),
+            HttpKeepaliveConfig::Count(1),
+            "30s",
+            100,
+        )
+        .await;
+
+        let (client, server) = tokio::io::duplex(2048);
+        tokio::task::spawn_local(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        send_process_chain_request(&mut sender, "/tunnel-reuse-a").await;
+        send_process_chain_request(&mut sender, "/tunnel-reuse-b").await;
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn test_process_chain_http_server_named_http_keepalive_requests_replaces_connection() {
+        let (addr, accepted) = spawn_counting_http_upstream().await;
+        let (http_server, _server_mgr) = test_process_chain_server_with_named_http_upstream(
+            format!("http://127.0.0.1:{}/", addr.port()),
+            HttpKeepaliveConfig::Count(1),
+            "30s",
+            1,
+        )
+        .await;
+
+        let (client, server) = tokio::io::duplex(2048);
+        tokio::task::spawn_local(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        send_process_chain_request(&mut sender, "/request-limit-a").await;
+        send_process_chain_request(&mut sender, "/request-limit-b").await;
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn test_process_chain_http_server_named_http_keepalive_timeout_replaces_connection() {
+        let (addr, accepted) = spawn_counting_http_upstream().await;
+        let (http_server, _server_mgr) = test_process_chain_server_with_named_http_upstream(
+            format!("http://127.0.0.1:{}/", addr.port()),
+            HttpKeepaliveConfig::Count(1),
+            "50ms",
+            100,
+        )
+        .await;
+
+        let (client, server) = tokio::io::duplex(2048);
+        tokio::task::spawn_local(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        send_process_chain_request(&mut sender, "/idle-timeout-a").await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        send_process_chain_request(&mut sender, "/idle-timeout-b").await;
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn test_process_chain_http_server_named_http_without_keepalive_does_not_reuse_connection()
+    {
+        let (addr, accepted) = spawn_counting_http_upstream().await;
+        let (http_server, _server_mgr) =
+            test_process_chain_server_with_named_http_upstream_config(HttpNamedUpstreamConfig {
+                url: format!("http://127.0.0.1:{}/", addr.port()),
+                keepalive: None,
+                keepalive_timeout: None,
+                keepalive_requests: None,
+            })
+            .await;
+
+        let (client, server) = tokio::io::duplex(2048);
+        tokio::task::spawn_local(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        send_process_chain_request(&mut sender, "/no-reuse-a").await;
+        send_process_chain_request(&mut sender, "/no-reuse-b").await;
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn test_process_chain_http_server_strips_connection_close_before_upstream_keepalive() {
+        let (addr, accepted) = spawn_counting_http_upstream().await;
+        let (http_server, _server_mgr) = test_process_chain_server_with_named_http_upstream(
+            format!("http://127.0.0.1:{}/", addr.port()),
+            HttpKeepaliveConfig::Count(1),
+            "30s",
+            100,
+        )
+        .await;
+
+        let mut close_headers = http::HeaderMap::new();
+        close_headers.insert(
+            http::header::CONNECTION,
+            http::HeaderValue::from_static("close"),
+        );
+
+        send_one_process_chain_request(http_server.clone(), "/strip-close-a", close_headers).await;
+        send_one_process_chain_request(http_server, "/strip-close-b", http::HeaderMap::new()).await;
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "local")]
+    async fn test_process_chain_http_server_strips_upstream_connection_close_from_response() {
+        let (addr, _accepted) = spawn_connection_close_http_upstream().await;
+        let (http_server, _server_mgr) = test_process_chain_server_with_named_http_upstream(
+            format!("http://127.0.0.1:{}/", addr.port()),
+            HttpKeepaliveConfig::Count(1),
+            "30s",
+            100,
+        )
+        .await;
+
+        let (client, server) = tokio::io::duplex(2048);
+        tokio::task::spawn_local(async move {
+            hyper_serve_http(Box::new(server), http_server, StreamInfo::default())
+                .await
+                .unwrap();
+        });
+
+        let (mut sender, conn) = hyper::client::conn::http1::Builder::new()
+            .handshake(TokioIo::new(client))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        send_process_chain_request(&mut sender, "/upstream-close-a").await;
+        send_process_chain_request(&mut sender, "/upstream-close-b").await;
+    }
+
+    #[test]
+    fn test_strip_hop_by_hop_headers_removes_proxy_authentication_headers() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::PROXY_AUTHORIZATION,
+            http::HeaderValue::from_static("Basic client-proxy-credentials"),
+        );
+        headers.insert(
+            http::header::PROXY_AUTHENTICATE,
+            http::HeaderValue::from_static("Basic realm=upstream-proxy"),
+        );
+        headers.insert(
+            http::header::AUTHORIZATION,
+            http::HeaderValue::from_static("Bearer origin-credentials"),
+        );
+        headers.insert(
+            http::header::WWW_AUTHENTICATE,
+            http::HeaderValue::from_static("Bearer realm=origin"),
+        );
+
+        ProcessChainHttpServer::strip_hop_by_hop_headers(&mut headers);
+
+        assert!(!headers.contains_key(http::header::PROXY_AUTHORIZATION));
+        assert!(!headers.contains_key(http::header::PROXY_AUTHENTICATE));
+        assert!(headers.contains_key(http::header::AUTHORIZATION));
+        assert!(headers.contains_key(http::header::WWW_AUTHENTICATE));
+    }
+
+    #[tokio::test]
+    async fn test_pooled_http_connect_failure_records_tunnel_failure_reason() {
+        let server = test_http_server_for_pooled_forward().await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let uri = format!("http://127.0.0.1:{}/connect-refused", addr.port());
+        let request_url = Url::parse(&uri).unwrap();
+        let client = build_test_pooled_client(&server, &uri, 1, Duration::from_secs(30), 100).await;
+        let mut req_slot = Some(
+            Request::builder()
+                .method(http::Method::GET)
+                .uri(uri.as_str())
+                .body(
+                    Full::new(Bytes::new())
+                        .map_err(|e| match e {})
+                        .boxed_unsync(),
+                )
+                .unwrap(),
+        );
+
+        let err = server
+            .forward_to_pooled_http_candidate(
+                &mut req_slot,
+                &client,
+                "/connect-refused",
+                Some(&request_url),
+                http::HeaderMap::new(),
+                http::Method::GET,
+                http::Version::HTTP_11,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.msg().contains("Failed to acquire pooled upstream"));
+        assert!(req_slot.is_some());
+        let history = server.tunnel_manager.list_tunnel_url_history().await;
+        assert_eq!(history.len(), 1);
+        let reason = history[0]
+            .current
+            .failure_reason
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            reason.starts_with(TunnelFailureReason::ConnectRefused.as_str())
+                || reason.starts_with(TunnelFailureReason::ConnectTimeout.as_str()),
+            "unexpected failure reason: {}",
+            reason
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pooled_http_pool_internal_failure_does_not_mark_url_unreachable() {
+        let server = test_http_server_for_pooled_forward().await;
+        let (addr, _accepted) = spawn_counting_http_upstream().await;
+        let uri = format!("http://127.0.0.1:{}/pool-clearing", addr.port());
+        let request_url = Url::parse(&uri).unwrap();
+        let client = build_test_pooled_client(&server, &uri, 1, Duration::from_secs(30), 100).await;
+
+        // Keep the only connection leased so close() remains in its clearing
+        // state while the request below attempts to acquire another stream.
+        let held_stream = client.client.acquire_stream().await.unwrap();
+        let closing_client = client.client.clone();
+        let close_task = tokio::spawn(async move {
+            closing_client.close().await;
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let mut req_slot = Some(
+            Request::builder()
+                .method(http::Method::GET)
+                .uri(uri.as_str())
+                .body(
+                    Full::new(Bytes::new())
+                        .map_err(|e| match e {})
+                        .boxed_unsync(),
+                )
+                .unwrap(),
+        );
+
+        let err = server
+            .forward_to_pooled_http_candidate(
+                &mut req_slot,
+                &client,
+                "/pool-clearing",
+                Some(&request_url),
+                http::HeaderMap::new(),
+                http::Method::GET,
+                http::Version::HTTP_11,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), ServerErrorCode::StreamError);
+        assert!(req_slot.is_some());
+        let history = server.tunnel_manager.list_tunnel_url_history().await;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].success_count, 1);
+        assert_eq!(history[0].failure_count, 0);
+
+        drop(held_stream);
+        close_task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pooled_http_reused_connection_failure_does_not_mark_url_unreachable() {
+        let server = test_http_server_for_pooled_forward().await;
+        let (addr, accepted) = spawn_reused_connection_failure_http_upstream().await;
+        let uri = format!("http://127.0.0.1:{}/stale-reuse", addr.port());
+        let request_url = Url::parse(&uri).unwrap();
+        let client = build_test_pooled_client(&server, &uri, 1, Duration::from_secs(30), 100).await;
+
+        send_test_pooled_request_with_history(&server, &client, &uri, Some(&request_url)).await;
+
+        let mut req_slot = Some(
+            Request::builder()
+                .method(http::Method::GET)
+                .uri(uri.as_str())
+                .body(
+                    Full::new(Bytes::new())
+                        .map_err(|e| match e {})
+                        .boxed_unsync(),
+                )
+                .unwrap(),
+        );
+        let err = server
+            .forward_to_pooled_http_candidate(
+                &mut req_slot,
+                &client,
+                "/stale-reuse",
+                Some(&request_url),
+                http::HeaderMap::new(),
+                http::Method::GET,
+                http::Version::HTTP_11,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(err.msg().contains("Failed to request pooled upstream"));
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+        let history = server.tunnel_manager.list_tunnel_url_history().await;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].success_count, 1);
+        assert_eq!(history[0].failure_count, 0);
+        assert!(history[0].current.failure_reason.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_pooled_non_http_open_failure_is_not_recorded_twice() {
+        let server = test_http_server_for_pooled_forward().await;
+        let uri = "unsupported-pool:///service";
+        let request_url = Url::parse(uri).unwrap();
+        let client = build_test_pooled_client(&server, uri, 1, Duration::from_secs(30), 100).await;
+        let mut req_slot = Some(
+            Request::builder()
+                .method(http::Method::GET)
+                .uri("/")
+                .body(
+                    Full::new(Bytes::new())
+                        .map_err(|e| match e {})
+                        .boxed_unsync(),
+                )
+                .unwrap(),
+        );
+
+        let err = server
+            .forward_to_pooled_http_candidate(
+                &mut req_slot,
+                &client,
+                "/",
+                Some(&request_url),
+                http::HeaderMap::new(),
+                http::Method::GET,
+                http::Version::HTTP_11,
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(err.code(), ServerErrorCode::TunnelError);
+        assert!(req_slot.is_some());
+        let history = server.tunnel_manager.list_tunnel_url_history().await;
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].failure_count, 1);
+        let reason = history[0]
+            .current
+            .failure_reason
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            reason.starts_with(TunnelFailureReason::UnsupportedScheme.as_str()),
+            "unexpected failure reason: {}",
+            reason
+        );
+    }
+
+    #[test]
+    fn test_named_upstream_config_accepts_https_keepalive() {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "api_a".to_string(),
+            HttpNamedUpstreamConfig {
+                url: "https://api-a.internal:8443/".to_string(),
+                keepalive: Some(HttpKeepaliveConfig::Enabled(true)),
+                keepalive_timeout: None,
+                keepalive_requests: None,
+            },
+        );
+        let config = test_http_config_with_upstreams(upstreams);
+
+        let runtime = ProcessChainHttpServerBuilder::build_named_upstreams(&config).unwrap();
+        assert!(runtime.get("api_a").unwrap().keepalive.is_some());
+    }
+
+    #[test]
+    fn test_named_upstream_config_accepts_keepalive_for_tunnel_url() {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "api_a".to_string(),
+            HttpNamedUpstreamConfig {
+                url: "tcp://127.0.0.1:8080/".to_string(),
+                keepalive: Some(HttpKeepaliveConfig::Enabled(true)),
+                keepalive_timeout: None,
+                keepalive_requests: None,
+            },
+        );
+        let config = test_http_config_with_upstreams(upstreams);
+
+        let runtime = ProcessChainHttpServerBuilder::build_named_upstreams(&config).unwrap();
+        assert!(runtime.get("api_a").unwrap().keepalive.is_some());
+    }
+
+    #[test]
+    fn test_named_http_upstream_rejects_url_fragment() {
+        let mut upstreams = HashMap::new();
+        upstreams.insert(
+            "api_a".to_string(),
+            HttpNamedUpstreamConfig {
+                url: "https://api-a.internal:8443/api/#fragment".to_string(),
+                keepalive: None,
+                keepalive_timeout: None,
+                keepalive_requests: None,
+            },
+        );
+        let config = test_http_config_with_upstreams(upstreams);
+
+        let error = ProcessChainHttpServerBuilder::build_named_upstreams(&config).unwrap_err();
+        assert_eq!(error.code(), ServerErrorCode::InvalidConfig);
+    }
+
+    async fn run_test_tls_handshake(
+        certificate_chain: Vec<CertificateDer<'static>>,
+        private_key: rustls::pki_types::PrivateKeyDer<'static>,
+        client_config: Arc<RustlsClientConfig>,
+        server_name: &str,
+    ) -> Result<(), String> {
+        let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(certificate_chain, private_key)
+        .unwrap();
+        let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tls_acceptor
+                .accept(stream)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        });
+
+        let tcp_stream = TcpStream::connect(addr).await.unwrap();
+        let server_name = ServerName::try_from(server_name.to_string()).unwrap();
+        let client_result = TlsConnector::from(client_config)
+            .connect(server_name, tcp_stream)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        let server_result = server_task.await.unwrap();
+        match client_result {
+            Ok(()) => server_result,
+            Err(error) => Err(error),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_proxy_ssl_verify_trust_hostname_and_depth() {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, Issuer, KeyPair};
+
+        let root_key = KeyPair::generate().unwrap();
+        let mut root_params = CertificateParams::new(vec!["Test Root CA".to_string()]).unwrap();
+        root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let root_cert = root_params.self_signed(&root_key).unwrap();
+
+        let intermediate_key = KeyPair::generate().unwrap();
+        let mut intermediate_params =
+            CertificateParams::new(vec!["Test Intermediate CA".to_string()]).unwrap();
+        intermediate_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let root_issuer = Issuer::from_params(&root_params, &root_key);
+        let intermediate_cert = intermediate_params
+            .signed_by(&intermediate_key, &root_issuer)
+            .unwrap();
+
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        let intermediate_issuer = Issuer::from_params(&intermediate_params, &intermediate_key);
+        let leaf_cert = leaf_params
+            .signed_by(&leaf_key, &intermediate_issuer)
+            .unwrap();
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let root_path = temp_dir.path().join("root.pem");
+        std::fs::write(&root_path, root_cert.pem()).unwrap();
+        let certificate_chain = vec![
+            CertificateDer::from(leaf_cert.clone()),
+            CertificateDer::from(intermediate_cert.clone()),
+        ];
+        let new_private_key = || {
+            rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+                leaf_key.serialize_der(),
+            ))
+        };
+
+        let verify_depth_one =
+            ProcessChainHttpServer::build_upstream_tls_config(true, root_path.to_str(), 1).unwrap();
+        run_test_tls_handshake(
+            certificate_chain.clone(),
+            new_private_key(),
+            verify_depth_one.clone(),
+            "localhost",
+        )
+        .await
+        .unwrap();
+
+        let hostname_error = run_test_tls_handshake(
+            certificate_chain.clone(),
+            new_private_key(),
+            verify_depth_one,
+            "wrong.example",
+        )
+        .await
+        .unwrap_err();
+        assert!(hostname_error.to_ascii_lowercase().contains("name"));
+
+        let untrusted_root_key = KeyPair::generate().unwrap();
+        let mut untrusted_root_params =
+            CertificateParams::new(vec!["Other Root CA".to_string()]).unwrap();
+        untrusted_root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let untrusted_root_cert = untrusted_root_params
+            .self_signed(&untrusted_root_key)
+            .unwrap();
+        let untrusted_root_path = temp_dir.path().join("untrusted-root.pem");
+        std::fs::write(&untrusted_root_path, untrusted_root_cert.pem()).unwrap();
+        let untrusted_config = ProcessChainHttpServer::build_upstream_tls_config(
+            true,
+            untrusted_root_path.to_str(),
+            1,
+        )
+        .unwrap();
+        let trust_error = run_test_tls_handshake(
+            certificate_chain.clone(),
+            new_private_key(),
+            untrusted_config,
+            "localhost",
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            trust_error
+                .to_ascii_lowercase()
+                .contains("invalid peer certificate"),
+            "unexpected untrusted-certificate error: {trust_error}"
+        );
+
+        let verify_depth_zero =
+            ProcessChainHttpServer::build_upstream_tls_config(true, root_path.to_str(), 0).unwrap();
+        let depth_error = run_test_tls_handshake(
+            certificate_chain,
+            new_private_key(),
+            verify_depth_zero,
+            "localhost",
+        )
+        .await
+        .unwrap_err();
+        assert!(depth_error.contains("proxy_ssl_verify_depth 0"));
+    }
+
+    #[test]
+    fn test_proxy_ssl_verify_requires_trusted_certificate() {
+        let error = ProcessChainHttpServer::build_upstream_tls_config(true, None, 1).unwrap_err();
+        assert_eq!(error.code(), ServerErrorCode::InvalidConfig);
+    }
+
+    #[tokio::test]
+    async fn test_pooled_https_client_reuses_connection() {
+        let cert_key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = cert_key.cert.der().clone();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(cert_key.signing_key.serialize_der()),
+        );
+        let server_config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+        let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let accepted_server = accepted.clone();
+
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                accepted_server.fetch_add(1, Ordering::SeqCst);
+                let tls_acceptor = tls_acceptor.clone();
+                tokio::spawn(async move {
+                    let tls_stream = tls_acceptor.accept(stream).await.unwrap();
+                    let service = hyper::service::service_fn(
+                        |req: http::Request<hyper::body::Incoming>| async move {
+                            let _ = req.collect().await;
+                            Ok::<_, ServerError>(
+                                http::Response::builder()
+                                    .status(StatusCode::OK)
+                                    .body(
+                                        Full::new(Bytes::from_static(b"ok"))
+                                            .map_err(|e| match e {})
+                                            .boxed(),
+                                    )
+                                    .unwrap(),
+                            )
+                        },
+                    );
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(tls_stream), service)
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+
+        let server = test_http_server_for_pooled_forward().await;
+        let uri = format!("https://localhost:{}/reuse", addr.port());
+        let client = build_test_pooled_client(&server, &uri, 1, Duration::from_secs(30), 100).await;
+
+        for _ in 0..2 {
+            send_test_pooled_request(&server, &client, &uri).await;
+        }
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn test_factory() {
+        let config = ProcessChainHttpServerConfig {
+            id: "test".to_string(),
+            ty: "http".to_string(),
+            version: None,
+            h3_port: None,
+            hook_point: ProcessChainConfigs::default(),
+            post_hook_point: None,
+            forward: None,
+            trusted_upstreams: Vec::new(),
+            proxy_ssl_verify: false,
+            proxy_ssl_trusted_certificate: None,
+            proxy_ssl_verify_depth: default_proxy_ssl_verify_depth(),
+            gzip: false,
+            gzip_types: Vec::new(),
+            gzip_min_length: default_gzip_min_length(),
+            gzip_comp_level: default_gzip_comp_level(),
+            gzip_http_version: default_gzip_http_version(),
+            gzip_vary: false,
+            gzip_disable: None,
+            gzip_request: false,
+            brotli: false,
+            brotli_types: Vec::new(),
+            brotli_min_length: default_brotli_min_length(),
+            brotli_comp_level: default_brotli_comp_level(),
+            upstreams: HashMap::new(),
         };
         let server_mgr = Arc::new(ServerManager::new());
         let context = HttpServerContext::new(

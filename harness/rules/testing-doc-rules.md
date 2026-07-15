@@ -1,14 +1,11 @@
 # Testing Document Rules
 
 ## Goal
-- Define optional persistent testing artifacts and the required post-implementation testing responsibilities.
+- Define optional persistent testing artifacts and post-implementation testing responsibilities.
 
 ## Scope
-- `docs/versions/<version>/modules/<module>/testing.md`
-- `docs/versions/<version>/modules/<module>/testing/`
-- `docs/versions/<version>/modules/<module>/<submodule>/testing.md` when a large module is split into direct submodule packets
-- `docs/versions/<version>/modules/<module>/testplan.yaml`
-- `docs/versions/<version>/modules/<module>/<submodule>/testplan.yaml` when a large module is split into direct submodule packets
+- `docs/versions/<version>/modules/<project>/<task-seq>-<task-slug>/testing.md`, `testing/`, and `testplan.yaml`.
+- Cross-project testing artifacts under `docs/versions/<version>/modules/globals/<task-seq>-<task-slug>/`.
 
 ## Metadata For Optional Testing Documents
 - `module`
@@ -18,43 +15,54 @@
 - `approved_at`
 
 ## Required Content
-- test cases designed after implementation from proposal, design, and delivered code
-- submodule test coverage mapped to design and implementation
-- module-level verification
-- external interface verification
-- validation rationale that ties checks to concrete behaviors, risks, or success criteria
-- coverage rationale for relevant normal, boundary, negative, error, compatibility, lifecycle, and cross-module cases
-- case-type coverage table for normal, boundary, negative, error, compatibility, lifecycle, and cross-module coverage for each tested `change_id`
-- definition of done
-- stable test entrypoints aligned with `testplan.yaml` for completed testing work
-- direct change coverage for implemented work
-- stable `change_id` values matching proposal and design items
-- explicit gap records where direct validation does not yet exist
-- large-module submodule test documentation when design uses direct submodules
+- Test cases designed after implementation from proposal, design, and delivered code.
+- Submodule, module, external interface, and direct `change_id` coverage.
+- Validation rationale tied to concrete behaviors, risks, and success criteria.
+- Case-type coverage for normal, boundary, negative, error, compatibility, lifecycle, and cross-module cases, including the implementing test level.
+- Per-level tables: `## Unit Tests`, `## DV Tests`, `## Integration Tests`, following `harness/rules/test-design-rules.md`.
+- `## Design Element Coverage` mapping parameter domains, state transitions, failure paths, error categories, invariants, and concurrency declarations to cases or gaps.
+- Stable test entrypoints aligned with `testplan.yaml` for completed testing work.
+- For breaking/migration-required public APIs, crate-root export changes, or build-surface changes: a file-level repository consumer closure and risk-triggered contract checks derived from design.
+- Explicit gap records for missing direct validation.
+- Large-module submodule test documentation when design uses direct submodules.
 
 ## Guardrails
-- Testing must operationalize approved proposal/design intent against the delivered implementation.
-- Optional testing documents that use approval metadata follow the same approval authority rule: agents MUST NOT set `status: approved` on their own initiative; user approvals require a filled `## Approval Record`, and auto-pipeline approvals require `harness/pipeline-plan.md` launch evidence.
-- Testing tasks run after implementation completes and MUST inspect `proposal.md`, `design.md`, and the delivered code before designing test cases.
-- Testing tasks are single-stage by default and MUST NOT edit `proposal.md`, `design.md`, `design/`, acceptance artifacts, or production code unless the user explicitly requested those additional stages.
-- Testing tasks may modify test code, test fixtures, test runners, and optional testing artifacts.
-- Testing tasks may modify unified test entrypoint wiring when needed to register the generated tests.
-- Testing tasks must not rewrite proposal, design, or production implementation artifacts.
-- If proposal/design split a large module into direct submodules and optional testing artifacts are generated, those artifacts MUST mirror that split using submodule packets under the large module directory, such as `docs/versions/<version>/modules/<module>/<submodule>/testing.md` and `testplan.yaml`, not `testing/<submodule>/`.
-- Human-authored testing docs MUST stay under 1000 lines each. Any testing document that would exceed 1000 lines MUST be split by submodule, responsibility, validation layer, or interface boundary and the test document index MUST be updated.
+- Testing operationalizes approved proposal/design intent against delivered implementation.
+- Optional testing docs with approval metadata follow the common approval authority rule; agents MUST NOT approve their own testing docs.
+- Testing runs after implementation and MUST inspect proposal, design, and delivered code before designing cases.
+- Test design MUST follow `harness/rules/test-design-rules.md`: unit covers changed-code branches, DV covers lifecycle/workflows/failure workflow, and integration covers consumed exported-interface success and failure semantics.
+- Test cases MUST derive from design elements and record concrete evidence in `## Design Element Coverage`; `not-applicable` rows need a concrete design source.
+- Verify each behavior at the lowest test level that can expose its failure; duplicate cross-level verification records a reason.
+- Failure paths, error categories, or state transitions found in code but missing from design return to design.
+- Testing tasks are single-stage by default and MUST NOT edit proposal, design, acceptance, production code, `docs/architecture/`, or another task packet unless explicitly requested.
+- Testing may modify test code, fixtures, runners, optional testing artifacts, and unified test entrypoint wiring needed to register tests.
+- Code inside an existing Rust `#[cfg(test)]` item is test code. Every newly created unit test MUST live in a dedicated test file, test directory, or test-only crate/package; testing MUST NOT add new inline test bodies to production source files.
+- A production-path Rust file passes testing-stage scope only when `stage-scope-check.py --baseline-manifest .harness/baselines/<task-id>/manifest.json` compares it with a pre-edit snapshot captured by `baseline-snapshot.py` and proves that every change is inside a pre-existing exact `#[cfg(test)]` item. Missing/tampered baselines, new inline items, and mixed production/test changes fail closed.
+- Baseline capture is project-local generated state. `.harness/` MUST be git-ignored, and testing tasks MUST NOT use `GIT_INDEX_FILE`, `git read-tree`, `git write-tree`, or `git commit-tree` to create synthetic Git baseline objects.
+- Task-local testing artifacts stay in the same task packet, not older `testing/<task-seq>-<task-slug>/` directories.
+- Human-authored testing docs MUST stay under 1000 lines, splitting by submodule, responsibility, validation layer, or interface boundary when needed.
 - Every implemented change MUST have direct validation coverage or an explicit gap.
-- Every completed testing task MUST generate or update `testplan.yaml` unless a repo-local versioned rule explicitly disables machine-readable test metadata for the current module and the testing task records that exception.
-- Every implemented `change_id` MUST map to a validation id and a generated test implementation or `testplan.yaml` step unless the validation path is explicitly `manual` or `disabled`.
-- Every implemented `change_id` MUST have `## Case-Type Coverage` rows for normal, boundary, negative, error, compatibility, lifecycle, and cross-module coverage. Each non-covered, manual, disabled, or not-applicable row MUST include a concrete reason.
+- Completed testing MUST generate/update `testplan.yaml` unless a repo-local versioned exception records reason, owner, risk, and acceptance impact.
+- Every implemented `change_id` MUST map to validation ids and generated tests or `testplan.yaml` steps unless the validation path is `manual` or `disabled`.
+- Every implemented `change_id` MUST have case-type rows; non-covered, manual, disabled, or not-applicable rows need concrete reasons.
 - Every generated or changed automated test MUST be reachable through `harness/scripts/test-run.py`.
-- Testing is not complete until `uv run --active python ./harness/scripts/test-run.py <module> all` reaches the module tests and `uv run --active python ./harness/scripts/test-run.py all all` reaches all project tests registered with the harness.
-- Test execution evidence is the machine-written run artifact under `harness/evidence/test-runs/` that `test-run.py` produces; cite the artifact path in testing evidence instead of pasting command output. Claimed runs without an artifact do not count.
-- For bugfix work, testing MUST produce a regression test bound to the bugfix `change_id` that reproduces the defect before the fix and passes after it (red-green). Record the failing pre-fix run artifact when reproduction is feasible; when it is not (for example the fix landed before testing started, or the defect needs an unavailable environment), record the concrete reason in the testing evidence instead. A bugfix validated only by happy-path tests is incomplete testing.
-- Case-type exemptions are tighter for triggered categories: when the proposal/design trigger matrix marks a category as `applies: yes`, the corresponding case-type rows (for example negative/error for security triggers, compatibility for data/contract triggers) may be `manual`, `disabled`, or not-covered only with a recorded owner, risk, and acceptance impact, not just a free-text reason.
-- Validation paths MUST prove a named behavior or risk; do not add unrelated checks as evidence.
-- If acceptance returns a testing gap, the testing stage must supplement the test design, test implementation, metadata when used, and unified-entrypoint runnable evidence for the missing case types before acceptance is retried.
-- If a layer is `manual` or `disabled`, the reason MUST appear in generated test evidence and optional testing metadata when present.
-- If a testing task discovers an upstream design or implementation problem, return work to the owning design or implementation stage instead of widening test scope silently.
-- If a testing change implies acceptance updates, record the downstream follow-up unless the user explicitly requested cross-stage synchronization.
-- Before testing completion, run `uv run --active python ./harness/scripts/doc-structure-check.py --version <version> --module <module> --docs testing` and `uv run --active python ./harness/scripts/testing-coverage-check.py --version <version> --module <module>`.
-- Use `testing-coverage-check.py --allow-missing-testplan` only when a repo-local versioned rule explicitly permits the exception and the testing evidence records the reason, owner, risk, and acceptance impact.
+- The task's `testplan.yaml` MUST declare `task_name`, register only as `<module>/<task-name>`, and be reachable through `<module>/<task-name> all` without being aggregated into the top-level module.
+- Single-task testing runs only `<module>/<task-name> <level-or-all>` from the active task plan. It MUST NOT trigger package/module suites, `all all`, root shortcuts, or quality gates; broader suites are explicit user-directed maintenance only.
+- Narrow exception: when design marks `public-api: breaking` / `migration-required`, a crate-root export change, or a build-surface change, the task-local plan MUST contain the required repository consumer contract checks. The invocation remains `<module>/<task-name> all`, but its task-local `repository-compile-closure` step MAY run a package/workspace compile-only command such as `cargo test -p <package> --no-run --all-targets` for the affected consumer closure. This exception does not authorize executing the package's runtime test suite.
+- Rust `--all-targets` excludes doctests. When documentation examples are affected, add a separate `documentation-examples` step such as `cargo test -p <package> --doc`, or a repository-defined README/example compile wrapper.
+- Breaking APIs MUST provide `external-positive`, `external-negative`, `removed-symbol-scan`, and `repository-compile-closure` contract checks. The negative wrapper must succeed only when compilation fails for the expected removed symbol; raw failing compiler commands are not valid evidence.
+- `removed-symbol-scan` MUST invoke the canonical `harness/scripts/consumer-closure-check.py`, which scans declared evidence-input roots, permits only explicitly recorded negative fixtures, and fails on remaining old-symbol references.
+- Migration-required APIs MUST provide `external-positive`, `removed-symbol-scan`, and `repository-compile-closure`. Crate-root export changes require external-positive plus compile closure; build-surface-only changes require compile closure. Documentation-example impact requires `documentation-examples`.
+- Risk-triggered tasks MUST declare `evidence_inputs` covering production scope, repository consumer files, external fixtures, test code, and affected documentation. Run artifacts bind their current content with `evidence_input_sha256` so acceptance rejects stale evidence.
+- Test execution evidence is the machine-written artifact under `test-results/test-runs/`; pasted command output is not evidence.
+- Bugfix testing MUST show red-green regression evidence for the bugfix `change_id`, or record why pre-fix reproduction is not feasible.
+- Validation paths MUST prove named behavior or risk, not unrelated checks.
+- Acceptance-returned testing gaps MUST supplement test design, test implementation, metadata when used, and unified-entrypoint runnable evidence before retry.
+- Manual or disabled layers require reasons in generated evidence and optional metadata when present.
+- Upstream design or implementation problems route to the owning stage instead of silently widening testing scope.
+- Downstream acceptance follow-up is recorded unless cross-stage synchronization is explicitly requested.
+- Before completion, run:
+  - manual flow: `UV_CACHE_DIR=.harness/uv-cache uv run --active python ./harness/scripts/doc-structure-check.py --version <version> --module <module> --docs testing` only when optional `testing.md` exists
+  - auto-pipeline: do not run `doc-structure-check.py --docs testing`, because `testing.md` / `testing/` are forbidden; validate pipeline testing evidence and `testplan.yaml` through `testing-coverage-check.py`
+  - `UV_CACHE_DIR=.harness/uv-cache uv run --active python ./harness/scripts/testing-coverage-check.py --version <version> --module <module>`
+- Use `testing-coverage-check.py --allow-missing-testplan` only with a recorded repo-local versioned exception.

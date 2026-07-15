@@ -47,6 +47,7 @@ libsocks_client = "*"
 sfo-result = "0.2"
 sfo-split = { version = "0.1.6", features = ["io"] }
 sfo-io = "0.1.18"
+sfo-http-pool = "0.1.1"
 sfo-sql = { version = "0.4", default-features = false, features = ["sqlite"] }
 serde_yaml_ng.workspace = true
 shlex.workspace = true

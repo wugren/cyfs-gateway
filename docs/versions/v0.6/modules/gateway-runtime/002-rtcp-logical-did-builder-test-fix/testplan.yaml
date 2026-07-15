@@ -1,0 +1,56 @@
+schema_version: 1
+version: v0.6
+module: gateway-runtime
+task_name: 002-rtcp-logical-did-builder-test-fix
+submodule: 002-rtcp-logical-did-builder-test-fix
+defaults:
+  workdir: .
+  timeout_sec: 900
+  env: {}
+api_impact:
+  public_api: none
+  crate_root_export_change: false
+  build_surface_change: false
+  documentation_examples_affected: false
+evidence_inputs: ["src/components/cyfs-gateway-lib/src/stack/rtcp_stack.rs"]
+contract_checks:
+  mode: disabled
+  reason: No public API, crate-root export, build-surface, or documentation-example impact.
+  steps: []
+levels:
+  unit:
+    mode: enabled
+    summary: Focused RTCP logical-DID builder regression at the lowest exposing level.
+    test_targets: ["src/components/cyfs-gateway-lib/src/stack/rtcp_stack.rs"]
+    preconditions:
+      tools: ["cargo"]
+      env: []
+      services: []
+      notes: ["Run serially because the test constructs a server runtime."]
+    steps:
+      - id: rtcp-logical-did-builder-unit
+        name: Execute the logical-DID missing-device-document-JWT builder regression
+        change_ids: ["P-rtcp-logical-did-builder-test-fix-1"]
+        run: ["bash", "-lc", "cd src && cargo test -p cyfs-gateway-lib stack::rtcp_stack::tests::test_rtcp_stack_builder_requires_device_doc_jwt_for_logical_did -- --test-threads=1"]
+  dv:
+    mode: disabled
+    summary: No production runtime workflow changes.
+    change_ids: ["P-rtcp-logical-did-builder-test-fix-1"]
+    reason: The defect is confined to an existing builder unit-test fixture; a DV run would not expose additional changed behavior.
+    test_targets: []
+    preconditions:
+      tools: []
+      env: []
+      services: []
+      notes: []
+  integration:
+    mode: disabled
+    summary: No exported interface or cross-module flow changes.
+    change_ids: ["P-rtcp-logical-did-builder-test-fix-1"]
+    reason: The task changes no consumed neighbor-module contract and is fully exposed by the focused unit regression.
+    test_targets: []
+    preconditions:
+      tools: []
+      env: []
+      services: []
+      notes: []

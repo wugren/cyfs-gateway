@@ -1,80 +1,79 @@
-# [模块阶段任务]
+# Manual Module Stage Task
 
-## 功能 / 阶段
-- 模块：
-- 版本：`v0.6`
-- 阶段：
-- 阶段职责：
-- 负责人：
-- 父任务：
-- 依赖：
+## Task Identity
 
-## 目标
-- 本阶段必须完成什么。
+- Task ID: `<task-seq>-<task-slug>`
+- Version:
+- Project module:
+- Packet path:
+- Stage: proposal / design / implementation / testing / acceptance
+- Stage responsibility:
+- Owner:
+- Depends on:
+- change_id values:
+- Exclusive write scope:
 
-## 输入
-- 上游工件：
-- 相关文档：
-- 相关代码：
-- 约束：
+## Goal
 
-## 准入检查
-- [ ] 必需上游工件已存在
-- [ ] 必需上游批准已存在
-- [ ] 当前任务没有跨出本阶段边界
-- [ ] 若为 implementation，`proposal.md`、`design.md`、`testing.md` 的 `status` 已满足准入规则
-- [ ] 若为 implementation，已确认这些已批准文档已经直接覆盖当前任务，而不是只有模块级基线描述
+- 描述本阶段必须交付的唯一结果与可观察完成信号。
 
-## 当前任务映射
-- Proposal 条目：
-- Design 条目：
-- Testing 条目或显式缺口：
-- 若缺失覆盖，应回退到哪个文档阶段补充：
+## Inputs
 
-## 工作内容
-- 这个任务应产出什么。
-- 在交接前必须验证什么。
-- 哪些内容要留给下一阶段。
+- Task proposal:
+- Active design source:
+- Existing stage artifacts:
+- Long-lived module / architecture docs:
+- Matching custom rules:
 
-## 步骤
-### 步骤 1
-- 动作：
-- 工具或技能：
-- 输出：
+## Entry Checks
 
-### 步骤 2
-- 动作：
-- 工具或技能：
-- 输出：
+- [ ] 当前 task 由用户、module Current/Active Task 或唯一 confirmed unfinished record 明确指向
+- [ ] Packet 名称与目录是 `<task-seq>-<task-slug>`
+- [ ] 当前阶段写入范围明确，未把其他阶段默认并入
+- [ ] Approved packet 没有被当作新需求或修正的可编辑容器
+- [ ] Implementation：version、packet module、target module 与 `change_id` 明确
+- [ ] Implementation：proposal 与 design 已读且直接覆盖请求
+- [ ] Implementation：current schema result 与 admission stamp 存在
+- [ ] Testing：production implementation 已完成；测试现在才从 proposal/design/code 推导
+- [ ] Acceptance：task test evidence 或 structured automated-test exception 已存在
 
-### 步骤 3
-- 动作：
-- 工具或技能：
-- 输出：
+## Scope
 
-## 交付物
-- 交付物 1：
-- 交付物 2：
+- Can modify:
+- Must not modify:
+- Current-task `.paths` manifest:
+- `.paths.meta.json` sidecar:
+- Optional Rust baseline manifest:
 
-## 完成标准
-- [ ] 目标已达成
-- [ ] 本阶段要求的证据已附带
-- [ ] 剩余风险已记录
+Stage defaults:
 
-## 下一阶段闸门
-- [ ] 下一阶段前置条件已满足
-- [ ] 如果下一阶段是 implementation，`proposal.md`、`design.md`、`testing.md` 已批准
-- [ ] 如果下一阶段是 implementation，已批准文档已经覆盖下一阶段的当前任务
+- Proposal：只写 task `proposal.md` 与 unfinished index bookkeeping。
+- Design：只写 task `design.md` / `design/` 与规则要求的长期边界同步；不设计测试。
+- Implementation：只写生产代码、必要非测试资源与 admission evidence。
+- Testing：只写测试、fixtures、runner、task `testplan.yaml`、可选 testing docs 与 run artifacts；不改生产行为。
+- Acceptance：只审计并写 task `acceptance-report.md` / 可选 guidance，不原地修复上游。
 
-## 失败回退路由
-- 回退到阶段：
-- 原因：
-- 是否阻塞：
+## Required Outputs
 
-## 允许修改范围
-- 可以修改：
-- 不可修改：
+- Output:
+- Evidence:
+- Follow-up / return route:
 
-Implementation 任务默认范围：
-- 可以修改：代码、测试代码
-- 不可修改：`proposal.md`、`design.md`、`design/`、`testing.md`、`testing/`、`testplan.yaml`、`acceptance.md`
+## Done Conditions
+
+- [ ] Required output exists
+- [ ] Current-stage structure/coverage checker passed when applicable
+- [ ] Task manifest stage-scope check passed
+- [ ] Testing：所有新/改测试通过 `harness/scripts/test-run.py <module>/<task-name> all` 可达
+- [ ] Acceptance：test design adequacy 与 implementation correctness categories 已审计
+- [ ] Checker results were reused unless their owned inputs changed
+- [ ] No unrelated user worktree changes were modified
+
+## Failure Routing
+
+- Proposal ambiguity/incorrect boundary：stop and ask user
+- Missing proposal mapping：return proposal
+- Missing design/interface/state/Scope Path：return design
+- Code defect against adequate design：return implementation
+- Missing/unreasonable/non-runnable validation：return testing
+- Acceptance finding：record issue id, owning stage, expected fix output, and iteration count

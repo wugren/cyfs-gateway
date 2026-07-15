@@ -2,125 +2,129 @@
 
 ## Goal
 - Define acceptance as an evidence-chain and consistency review.
-- Acceptance confirms that the behavior described by the approved documents is implemented, that the documents agree with each other and with the implementation, and that no document or implementation logic defect invalidates the result.
-- Git diff output is optional scoping evidence. It is not the acceptance standard, and diff-only cleanliness problems do not block acceptance unless they reveal a document inconsistency, document-to-implementation mismatch, missing approved behavior, or logical defect.
+- Acceptance confirms that approved behavior is implemented, documents agree with code/tests, and no logic defect invalidates the result.
+- Git diff output is optional scoping evidence, not the acceptance standard.
+- Acceptance defines a task-relevant scope before running checks and must not execute unrelated audits or commands.
 
 ## Required Audits
-Acceptance MUST perform:
-- document coverage audit for every behavior, non-goal, constraint, and acceptance boundary described by the approved documents
-- document consistency audit across proposal, design, optional testing artifacts, generated acceptance rules, expected results, and long-lived module docs
-- implementation consistency audit between the approved proposal/design documents and the delivered implementation/test evidence
-- test design adequacy audit for whether post-implementation tests reasonably cover proposal/design/code behavior, including normal, boundary, negative, error, compatibility, lifecycle, and cross-module cases where applicable
-- logic audit for contradictions, impossible states, missing cases, invalid assumptions, or other reasoning defects in documents or implementation
-- trigger matrix authenticity audit: for the reviewed change, verify that `applies: no` rows cite evidence that exists and actually supports non-applicability, and that `applies: yes` rows have their required checks present in the test or review evidence; template-like, copy-pasted, or unverifiable trigger evidence is a finding against the owning document stage
+Acceptance MUST audit:
+- Task-relevant scope: reviewed `change_id` values, active task packet, affected module paths, and evidence-bearing modules.
+- Document coverage for every approved behavior, non-goal, constraint, and acceptance boundary.
+- Consistency across task packet docs, generated acceptance rules, expected results, long-lived module docs, and relevant project-rule-governed `docs/architecture/` docs when applicable.
+- Implementation and test evidence against proposal, design, and relevant project architecture docs when applicable.
+- Test design adequacy for relevant normal, boundary, negative, error, compatibility, lifecycle, and cross-module cases.
+- Design quality: dependency direction, shared-submodule justification, interface minimality, compatibility decisions, data/state ownership, failure paths, alternatives, testability seams, and invariants.
+- Implementation correctness beyond test pass/fail: logic/control flow, termination/progress, concurrency/synchronization, resource lifetime/cleanup, state/data integrity, error handling/recovery, interface boundaries/compatibility, and security/capacity safety.
+- Logic defects: contradictions, impossible states, missing cases, invalid assumptions, or correctness risks.
 
-## Optional Diff Commands
-When useful for locating changed files or implementation evidence, run and record:
+## Evidence Discovery
+Optional changed-file discovery commands:
 - `git status --short`
 - `git diff --stat`
 - `git diff --name-status`
 - `git diff --check`
 
-These commands are evidence discovery tools only. Their output is not a pass/fail criterion by itself.
+These commands do not pass or fail acceptance by themselves. For public symbol, API, codec, or wire-format migrations, ad hoc `rg` is discovery only; accepted evidence must come from the task's machine-recorded removed-symbol-scan contract step.
 
-For public symbol, API, codec, or wire-format migrations, also run a targeted search such as:
-- `rg "old_symbol|old_encoding|old_method"`
+## Validation Evidence Reuse
+Acceptance MUST cite the existing passing schema result, admission stamp, stage-scope result, pipeline-plan result when applicable, and task-test artifact. It MUST NOT rerun those checkers or tests while their owned inputs are unchanged.
 
-## Required Harness Commands
-For every module needed as evidence for accepted behavior, run and record:
-- `uv run --active python ./harness/scripts/schema-check.py --version <version> --module <module>`
-- `uv run --active python ./harness/scripts/admission-check.py --version <version> --module <module> --change-id <change_id> --evidence-file harness/evidence/admission/<task-id>.md`
-- the relevant generated test commands through `uv run --active python ./harness/scripts/test-run.py <module> <level-or-all>`
+Rerun only the checker whose owned input changed after its latest pass:
+- schema: a schema-bearing packet document or metadata file changed
+- admission: a bound proposal/design/plan, admission evidence, target module, `change_id`, or admitted Scope Path changed
+- stage scope: the manifest, sidecar, baseline, governed task path, or admitted Scope Path changed
+- pipeline plan: task-local plan, state, or completion evidence changed
+- task tests: affected implementation, test code, testplan, or registered command changed
 
-For every direct submodule packet needed as evidence for accepted behavior, run the same commands with `--submodule <submodule>`.
+A stage transition, acceptance start, commit, CI run, or need to fill the report is not an input change. A missing prior result fails acceptance and returns to the owning stage; acceptance MUST NOT manufacture it by replaying the checker. Run `acceptance-report-check.py` only after creating or modifying the acceptance report itself.
 
-For whole-project evidence or final pipeline acceptance, run and record:
-- `uv run --active python ./harness/scripts/test-run.py all all`
-- the project-root shortcut with no arguments, for example `test-run.bat` or `./test-run.sh`, unless the current platform cannot execute that format
+Task-relevant execution evidence MUST be a machine-written task artifact under `test-results/test-runs/`. Reuse it when its implementation, tests, testplan, and registered command inputs are unchanged. The acceptance checker MUST compare report `Version`, `Module`, `Task name`, and reviewed `change_id` values to artifact `testplans`, `requested_module`, `requested_level`, `change_ids`, and non-empty successful executed steps; exit code alone is insufficient. It MUST NOT require or validate a repository/package state hash. An accepted report without an automated task run MUST include a structured `## Automated Test Exception` with `Applies: yes`, concrete reason, owner, risk, acceptance impact, and alternative evidence. A bare `not applicable` statement is invalid.
 
-For code-level quality evidence, run and record:
-- `uv run --active python ./harness/scripts/quality-check.py` (per `harness/rules/quality-gate-rules.md`; required whenever `harness/quality-gates.yaml` declares at least one gate)
+Quality gates are not part of automatic single-task acceptance. Changes under `harness/**` or `docs/**` never trigger them. They may be run and cited only after an explicit user request.
 
-For single-stage tasks, run and record:
-- `uv run --active python ./harness/scripts/stage-scope-check.py --stage <stage> --version <version> --module <module>` (plus `--submodule <submodule>` for submodule packets; implementation-stage runs additionally pass `--change-id <change_id>` per admitted id so the diff is bound to the design Scope Paths)
+## Evidence Scope
+Acceptance MUST identify the documents, code paths, tests, and results used for each approved behavior. Unrelated worktree churn and unrelated validations are not blocking and must not be executed as acceptance requirements. Reject only when reviewed evidence shows missing approved behavior, document inconsistency, project-rule-governed architecture doc inconsistency, document/code mismatch, logical contradiction, unsupported assumption, or relevant correctness defect.
 
-For the acceptance report, run and record before completion:
-- `uv run --active python ./harness/scripts/acceptance-report-check.py <report>`
+## Cross-Module Admission
+- Every evidence-bearing module or task packet MUST have approved manual-flow proposal/design coverage or launch-confirmed auto-pipeline proposal/design mappings, direct `change_id` mapping, and post-implementation test evidence or explicit gaps.
+- Every automated test used as evidence MUST be reachable through the unified test entrypoint.
+- Project-root shortcuts, package/module suites, and whole-project commands are explicit maintenance interfaces outside single-task acceptance.
+- Exception: acceptance still invokes only `<module>/<task-name> all`, but a risk-triggered task artifact MUST include its task-local repository compile-only closure and other required API contract steps. This is not permission to run a broad runtime suite.
+- Multi-project behavior MUST use a `globals/<task-seq>-<task-slug>/` packet and pass checks for each affected implementation scope.
+- New task evidence MUST come from the current task packet, not older packets; approved packets MUST NOT be treated as editable containers for new or expanded work.
+- Draft, missing, ambiguous, or non-covering docs fail acceptance even when workspace tests pass.
 
-Test and quality execution evidence MUST be the machine-written run artifacts (`harness/evidence/test-runs/*.json` from `test-run.py`, `harness/evidence/quality-runs/*.json` from `quality-check.py`): cite the artifact paths in the report. Pasted or summarized command output without a matching artifact is not execution evidence, and `acceptance-report-check.py` re-verifies that the referenced artifacts exist, passed, and are fresh.
+## Design Quality
+Acceptance checks the approved design against delivered implementation:
+- Dependency direction: shared/technical do not depend on business, and nothing depends on assembly.
+- Shared submodules: at least 2 real consumers and one clear responsibility.
+- Interfaces: every export has a real consumer or mapped `change_id`; interface changes carry compatibility and migration detail.
+- Data/state: each persistent datum or shared state is written only by its recorded owner.
+- Failure paths: code matches recorded timeout, retry, idempotency, and partial-completion behavior.
+- Alternatives: recorded alternatives are genuine, not template filler.
+- Testability seams: promised seams exist and were usable by tests or justified gaps.
+- Invariants: preserved-invariant regressions block acceptance.
 
-If a test layer is manual, disabled, or deferred, the acceptance report MUST cite the generated test evidence and any optional testing document or `testplan.yaml` reason.
+Structural findings return to design; implementation deviations from adequate design return to implementation.
 
-## Evidence Scope Audit
-Acceptance MUST identify the documents, code paths, tests, and results used as evidence for each approved behavior.
+## Test Design Adequacy
+Acceptance MUST review post-implementation test design before accepting:
+- Approved behaviors, constraints, non-goals, acceptance boundaries, and implemented `change_id` values map to tests or explicit gaps.
+- Relevant normal, boundary, negative, error, compatibility, lifecycle, concurrency/retry, and cross-module cases are covered.
+- Per-level contracts from `harness/rules/test-design-rules.md` are satisfied.
+- `## Design Element Coverage` rows trace to real design elements, not template-like evidence.
+- Each behavior is verified at the lowest effective level.
+- Completed testing includes `testplan.yaml` unless a versioned exception records reason, owner, risk, and acceptance impact.
+- Bugfix work shows red-green regression evidence or a concrete infeasibility reason.
+- Testing docs, metadata, implementation, and command evidence agree.
+- Broad smoke-only or unregistered tests do not count unless a concrete rationale explains why deeper validation is not applicable.
 
-Changed-file classification is optional and only supports evidence discovery. Do not reject acceptance merely because the working tree contains unrelated churn, formatting changes, generated files, or other diff noise. Reject only when the reviewed evidence shows:
-- an approved document behavior is not implemented
-- documents disagree with each other
-- documents and implementation disagree
-- a document contains a logical contradiction, unsupported assumption, or impossible requirement
-- implementation contains a logical correctness, compatibility, lifecycle, state, or error-handling defect relevant to the accepted behavior
+Incomplete, unreasonable, ambiguous, stale, or non-runnable test coverage returns to testing.
 
-## Cross-Module Admission Audit
-- Acceptance MUST NOT check only the current module or declared `change_id`.
-- Every evidence-bearing module MUST have approved proposal/design coverage and post-implementation test evidence.
-- Every evidence-bearing module MUST have a direct `change_id` mapping across proposal and design, plus generated test coverage or an explicit testing gap.
-- Every automated test used as acceptance evidence MUST be reachable through the unified test entrypoint.
-- The project-root test shortcut MUST delegate to the unified test entrypoint and must not maintain a separate test list.
-- Evidence spanning multiple modules MUST pass schema and admission checks independently for each affected module packet.
-- Evidence spanning multiple submodule packets MUST pass schema and admission checks independently for each affected submodule packet.
-- If the implementation evidence for an accepted behavior depends on a module with draft, missing, ambiguous, or non-covering proposal/design documents or missing test evidence, acceptance MUST fail even when workspace tests pass.
+## Implementation Correctness Audit
+Acceptance MUST inspect delivered code and relevant runtime evidence rather than infer correctness from passing tests. The report MUST contain one row for every category below; `not applicable` is allowed only with a concrete task-specific reason.
 
-## Test Design Adequacy Audit
-Acceptance MUST review the post-implementation test design before marking work accepted:
-- each approved behavior, constraint, non-goal, acceptance boundary, and implemented `change_id` MUST map to concrete test evidence or an explicit gap
-- normal success paths, boundary values, negative inputs, error paths, compatibility or migration behavior, lifecycle/state transitions, concurrency or retry behavior, and cross-module effects MUST be covered when relevant to the proposal/design/code
-- completed testing work MUST include `testplan.yaml` unless a repo-local versioned exception records reason, owner, risk, and acceptance impact
-- bugfix work MUST show red-green regression evidence: a regression test bound to the bugfix `change_id` that reproduced the defect (a failing pre-fix run artifact, or a recorded concrete reason why reproduction was not feasible) and passes after the fix; happy-path-only validation of a bugfix is a test design gap
-- optional `testing.md`, `testing/`, and required `testplan.yaml` must agree with the delivered test implementation and command evidence when present
-- tests that only prove the happy path are insufficient when the proposal/design/code creates meaningful edge, failure, compatibility, or integration risk
-- broad assertions, smoke-only tests, or unregistered tests do not count as complete coverage unless the acceptance report records why deeper validation is not applicable
+- Logic and control flow: incorrect algorithms or conditions, off-by-one behavior, wrong branch selection, unintended fallthrough, unreachable required behavior, numeric overflow/underflow, and invalid assumptions.
+- Termination and progress: infinite loops or recursion, hot spinning, permanently blocking waits, livelock, starvation, and retry loops without a bounded or externally controlled exit.
+- Concurrency and synchronization: data races, deadlocks and lock-order cycles, lost wakeups, non-atomic compound operations, ordering/visibility defects, unsafe shared state, cancellation races, and check-then-act races.
+- Resource lifetime and cleanup: memory, file, socket, transaction, thread, task, timer, subscription, lock, and device-handle leaks; double release, use-after-release, and missing cleanup on success, failure, timeout, or cancellation.
+- State and data integrity: illegal transitions, partial initialization or commit, multi-writer violations, corruption, stale cache/state, broken transaction boundaries, duplicate side effects, and retry/idempotency defects.
+- Error handling and recovery: swallowed or misclassified errors, incorrect fallback, missing rollback, retry storms, timeout/backpressure defects, partial-failure handling, and failure paths that leave the system unusable.
+- Interface boundary and compatibility: invalid input handling, null/empty/extreme values, serialization/encoding errors, API/wire/runtime semantic regressions, caller migration gaps, and trust-boundary mistakes.
+- Security and capacity safety: authorization/authentication bypass, injection, secret exposure, unsafe deserialization, path traversal, denial-of-service amplification, unbounded queues/memory/tasks, and algorithmic resource blowups where applicable.
 
-If the test design is incomplete, unreasonable, ambiguous, stale relative to delivered code, or not reachable through the unified test entrypoint, acceptance MUST fail and return work to the testing stage to supplement test design, test implementation, metadata, and runnable evidence before acceptance is retried.
-
-## Implementation Logic Checklist
-Acceptance MUST review the implementation evidence for correctness risks beyond test pass/fail:
-- public API, enum, codec, or wire-format changes
-- downstream semantic changes, compatibility shims, or migration behavior that is missing from design coverage or post-implementation test evidence
-- language-level invariant violations, such as inconsistent `Eq` and `Hash` behavior in Rust
-- concurrency, state-machine, resource-release, lifecycle, retry, or cancellation defects
-- error-path gaps and fallback behavior
-- risks that tests do not cover but that are logically inferable from the code
+Every defect MUST identify the earliest owning stage. If the proposal is ambiguous, contradictory, or incorrect, stop and ask the user. If the design's architecture, algorithm, state/concurrency/resource/interface/failure model is absent or wrong, return to design. If an adequate design exists but code is defective, return to implementation. If the defect is only missing or defective validation, return to testing. Acceptance MUST NOT repair the defect in place.
 
 ## Document Timing Consistency
-- Approval staleness is checked mechanically: every approved document records `approved_content_sha256`, and `schema-check.py` fails when the current content no longer matches it. A failing hash means the document changed after approval and needs re-approval before its content counts as approved evidence.
-- Downstream `design.md` approval metadata MUST NOT predate new proposal coverage it claims to implement.
-- Optional testing artifacts created before the final implementation MUST be regenerated or explicitly revalidated against the delivered code.
-- If approved documents receive new substantive content, acceptance MUST require re-approval; the re-approval updates `approved_content_sha256` in the same edit.
-- Acceptance MUST fail when approval state exists but the approved content does not directly cover the reviewed evidence.
+- Approved documents need a current `approved_content_sha256`; stale hashes show an invalid post-approval edit and do not authorize refreshing metadata on the old document. Use a sibling amendment/fix task for approved-document corrections.
+- Downstream design approval MUST NOT predate proposal coverage it claims to implement.
+- Testing artifacts created before final implementation MUST be regenerated or explicitly revalidated.
+- Acceptance fails when approval exists but approved content does not directly cover reviewed evidence.
 
 ## Acceptance Must Fail If
-- any approved behavior, constraint, non-goal, or acceptance boundary described by the documents is not implemented or cannot be verified
-- any required evidence module lacks approved proposal/design coverage or post-implementation test evidence
-- a single-stage task fails `stage-scope-check.py --stage <stage>`
-- public API, codec, wire format, or runtime semantics changed without direct design coverage and generated test coverage or an explicit gap
-- test design or test implementation does not reasonably cover the proposal/design/code behavior and relevant normal, boundary, negative, error, compatibility, lifecycle, or cross-module cases
-- required test evidence is ambiguous, stale, unregistered with the unified test entrypoint, or not mapped to the reviewed `change_id` values
-- required test or quality execution evidence lacks a matching machine-written run artifact, or the referenced artifact is missing, failing, or stale
-- `harness/quality-gates.yaml` declares gates but no fresh passing quality run artifact exists, or the config file itself is missing
-- a reviewed bugfix lacks red-green regression evidence for its `change_id` and no concrete infeasibility reason is recorded
-- the implementation diff was not bound to the admitted design Scope Paths (`stage-scope-check.py --stage implementation --change-id ...` missing or failing)
-- completed testing work lacks `testplan.yaml` and no repo-local versioned exception records reason, owner, risk, and acceptance impact
-- trigger matrix evidence for the reviewed change is template-like, copy-pasted, unverifiable, or contradicted by the inspected code
-- stage documents contradict each other, or downstream documents silently narrow or expand approved proposal intent
-- documents and implementation describe different behavior
-- any document or implementation contains a plausible correctness, compatibility, governance, or logical defect
-- the same non-requirement issue remains unresolved after more than 5 design -> implementation -> testing iterations
+- Approved behavior, constraint, non-goal, or acceptance boundary is missing or unverifiable.
+- Required evidence lacks approved manual-flow proposal/design coverage or launch-confirmed auto-pipeline proposal/design mappings, post-implementation test evidence, or required project-rule-governed architecture docs when applicable.
+- Stage scope checks are missing or failing.
+- Public API, codec, wire format, or runtime semantics changed without design coverage and test evidence or explicit gap.
+- Breaking/migration-required API, crate-root export, build-surface, or documentation-example impact lacks its mechanically required contract kinds, consumer closure, or current scoped evidence hash.
+- A breaking API is accepted only from one task artifact containing successful new-path external compilation, expected old-path rejection, removed-symbol scan, repository compile closure, and documentation example closure when applicable.
+- Test design/implementation does not reasonably cover proposal/design/code behavior and required per-level contracts.
+- Task-relevant test execution evidence lacks either a passing machine-written artifact with executed steps or a complete structured automated-test exception.
+- Quality gates are missing, unrun, or failing when the task scope or repo-local custom rules make them relevant.
+- Reviewed bugfix work lacks red-green regression evidence and no concrete infeasibility reason is recorded.
+- Implementation paths were not bound to admitted design `Scope Paths`.
+- Completed testing lacks `testplan.yaml` without a versioned exception.
+- Design quality audit finds dependency-direction violations, multi-writer state, exports without consumers, unrecorded breaking changes, or invariant regressions.
+- The implementation correctness audit is missing, omits a required category without a concrete not-applicable reason, or finds incorrect logic, non-termination, concurrency/synchronization defects, resource-lifetime defects, state/data corruption risks, error-recovery defects, boundary/compatibility defects, or security/capacity hazards.
+- Stage docs, relevant project-rule-governed architecture docs, implementation, or tests contradict each other or silently narrow/expand proposal intent.
+- Any document or implementation contains a plausible correctness, compatibility, governance, or logic defect.
+- The same non-requirement issue remains unresolved after more than 5 design -> implementation -> testing iterations.
 
 ## Report Format
-- Findings MUST appear first in the acceptance report and be sorted by severity.
-- Test success is supporting evidence only; it does not automatically mean accepted.
-- Any High finding MUST produce a `rejected` or `needs changes` conclusion.
-- The report MUST include generated acceptance rules, expected results, document coverage, consistency findings, implementation evidence, test design adequacy, harness command results, test evidence, optional diff summaries if used, iteration count, and unresolved risks.
-- The iteration count is defined mechanically, not from memory: for each blocking issue id, count the recorded acceptance returns for that issue id in `harness/pipeline-plan.md` (pipeline work) or the prior acceptance reports under `docs/versions/<version>/reviews/` that name the same issue id (non-pipeline work), plus the current run. When the count for one unresolved issue exceeds 5, stop and report the issue to the user instead of looping again.
-- `acceptance-report-check.py` MUST fail the report when these required fields are missing, placeholder-only, or incompatible with an `accepted` conclusion.
+- Findings come first, sorted by severity.
+- A human-readable result summary follows findings and explains the outcome, what was verified, the evidence used, and the next action in plain language.
+- Test success is supporting evidence only.
+- Any High finding produces `rejected` or `needs changes`.
+- The report MUST include acceptance rules, expected results, coverage/consistency findings, implementation evidence, the category-by-category implementation correctness audit, test design adequacy, harness command results, test evidence, optional diff summaries, iteration count, and unresolved risks.
+- Iteration count is derived from task-local `pipeline/state.json` return records or prior acceptance reports naming the same blocking issue id, plus the current run.
+- `acceptance-report-check.py` fails missing, placeholder-only, or conclusion-incompatible required fields.

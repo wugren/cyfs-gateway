@@ -2102,6 +2102,13 @@ impl Gateway {
         if let Some(server_id) = &call_server {
             actions.push(format!(r#"call-server {}"#, server_id));
         } else if let Some(forward) = forward_to {
+            if is_http {
+                // add_router historically preserves the inbound virtual Host.
+                // Make that policy explicit so the HTTP forwarder's default
+                // proxy Host rewrite does not redirect a dynamic router to the
+                // upstream gateway's authority instead.
+                actions.push(r#"${REQ.host} = ${REQ.host}"#.to_string());
+            }
             actions.push(format!(r#"forward "{}""#, forward));
         }
 
@@ -5414,7 +5421,7 @@ mod tests {
         println!("{}", rule);
         assert_eq!(
             rule,
-            r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "*" && forward "http://127.0.0.1:9000";"#
+            r#"starts-with ${REQ.path} "/sn" && rewrite ${REQ.path} "/sn*" "*" && ${REQ.host} = ${REQ.host} && forward "http://127.0.0.1:9000";"#
         );
 
         let (updated, removed_id) = Gateway::remove_router_from_config(
@@ -5446,7 +5453,7 @@ mod tests {
         println!("{}", rule);
         assert_eq!(
             rule,
-            r#"starts-with ${REQ.path} "/sn/" && rewrite ${REQ.path} "/sn/*" "/*" && forward "http://127.0.0.1:9000";"#
+            r#"starts-with ${REQ.path} "/sn/" && rewrite ${REQ.path} "/sn/*" "/*" && ${REQ.host} = ${REQ.host} && forward "http://127.0.0.1:9000";"#
         );
 
         let (updated, sid, _) = Gateway::add_router_to_config(
@@ -5468,7 +5475,7 @@ mod tests {
         println!("{}", rule);
         assert_eq!(
             rule,
-            r#"match ${REQ.path} "/sn/*" && rewrite ${REQ.path} "/sn/*" "/*" && forward "http://127.0.0.1:9000";"#
+            r#"match ${REQ.path} "/sn/*" && rewrite ${REQ.path} "/sn/*" "/*" && ${REQ.host} = ${REQ.host} && forward "http://127.0.0.1:9000";"#
         );
 
         let (updated, sid, _) = Gateway::add_router_to_config(
@@ -5490,7 +5497,7 @@ mod tests {
         println!("{}", rule);
         assert_eq!(
             rule,
-            r#"match ${REQ.path} "/sn/*" && rewrite ${REQ.path} "/sn/*" "/api/*" && forward "http://127.0.0.1:9000";"#
+            r#"match ${REQ.path} "/sn/*" && rewrite ${REQ.path} "/sn/*" "/api/*" && ${REQ.host} = ${REQ.host} && forward "http://127.0.0.1:9000";"#
         );
 
         let (updated, sid2, _) = Gateway::add_router_to_config(
@@ -5508,7 +5515,7 @@ mod tests {
             .unwrap()
             .to_string();
         println!("{}", rule);
-        assert!(rule.starts_with("match-reg ${REQ.path} \"^/static/(.*)\\$\" && rewrite-reg ${REQ.path} \"^/static/(.*)\\$\" \"/\\$1\" && forward \"http://127.0.0.1:9000\";"));
+        assert!(rule.starts_with("match-reg ${REQ.path} \"^/static/(.*)\\$\" && rewrite-reg ${REQ.path} \"^/static/(.*)\\$\" \"/\\$1\" && ${REQ.host} = ${REQ.host} && forward \"http://127.0.0.1:9000\";"));
 
         let (updated, sid2, _) = Gateway::add_router_to_config(
             raw_config.clone(),
@@ -5525,7 +5532,7 @@ mod tests {
             .unwrap()
             .to_string();
         println!("{}", rule);
-        assert!(rule.starts_with("match-reg ${REQ.path} \"^/static/(.*)\\$\" && rewrite-reg ${REQ.path} \"^/static/(.*)\\$\" \"/api/\\$1\" && forward \"http://127.0.0.1:9000\";"));
+        assert!(rule.starts_with("match-reg ${REQ.path} \"^/static/(.*)\\$\" && rewrite-reg ${REQ.path} \"^/static/(.*)\\$\" \"/api/\\$1\" && ${REQ.host} = ${REQ.host} && forward \"http://127.0.0.1:9000\";"));
 
         let (updated, sid2, _) = Gateway::add_router_to_config(
             raw_config.clone(),
@@ -5544,7 +5551,7 @@ mod tests {
         println!("{}", rule);
         assert_eq!(
             rule,
-            "match-reg ${REQ.path} \"^/static/(.*)\\$\" && rewrite ${REQ.path} \"/*\" \"/api/*\" && forward \"http://127.0.0.1:9000\";"
+            "match-reg ${REQ.path} \"^/static/(.*)\\$\" && rewrite ${REQ.path} \"/*\" \"/api/*\" && ${REQ.host} = ${REQ.host} && forward \"http://127.0.0.1:9000\";"
         );
 
         let (updated, sid2, _) = Gateway::add_router_to_config(
@@ -5564,7 +5571,7 @@ mod tests {
         println!("{}", rule);
         assert_eq!(
             rule,
-            "match-reg ${REQ.path} \"^/static/(.*)\\$\" && forward \"http://127.0.0.1:9000\";"
+            "match-reg ${REQ.path} \"^/static/(.*)\\$\" && ${REQ.host} = ${REQ.host} && forward \"http://127.0.0.1:9000\";"
         );
 
         // create with local dir target and explicit server id

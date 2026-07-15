@@ -2,14 +2,14 @@
 """Run the repository's declared mechanical quality gates (build, lint, ...).
 
 Gates are declared in harness/quality-gates.yaml. This checker fails closed:
-- a missing config file fails (declare your gates, or declare `gates: []`
-  explicitly as a versioned, reviewable decision)
+- a missing config file fails
+- `gates: []` fails unless `empty_reason` records a concrete versioned decision
 - any failing gate command fails the run
 
-Every real run writes a machine-readable artifact to
-harness/evidence/quality-runs/<timestamp>.json recording each gate's exit
-code. Acceptance cites that artifact, and acceptance-report-check.py
-re-verifies it, so quality-gate evidence cannot be claimed without a run.
+Every explicitly requested real run writes a machine-readable artifact to
+test-results/quality-runs/<timestamp>.json recording each gate's command and
+exit code. test-results/ is generated output and must be listed in .gitignore.
+Task execution and acceptance do not invoke this checker automatically.
 """
 
 from __future__ import annotations
@@ -52,6 +52,17 @@ def parse_gates(path: Path) -> list[dict[str, object]]:
     if not gates_line:
         fail(f"{path} missing required top-level key: gates")
     if gates_line.group(1):
+        reason_match = re.search(r"(?m)^empty_reason:\s*(.+)\s*$", text)
+        reason = reason_match.group(1).strip().strip('"').strip("'") if reason_match else ""
+        if (
+            not reason
+            or len(reason) < 12
+            or re.search(r"<[^>]+>|\b(tbd|todo|pending|n/a|none)\b", reason, re.IGNORECASE)
+        ):
+            fail(
+                f"{path} declares gates: [] but empty_reason is missing, placeholder-only, "
+                "or too short; record the concrete reason no mechanical quality gate applies"
+            )
         return []
 
     gates: list[dict[str, object]] = []
@@ -85,7 +96,7 @@ def parse_gates(path: Path) -> list[dict[str, object]]:
 
 
 def write_run_artifact(root: Path, steps: list[dict[str, object]], exit_code: int, started_at: str) -> None:
-    artifact_dir = root / "harness" / "evidence" / "quality-runs"
+    artifact_dir = root / "test-results" / "quality-runs"
     try:
         artifact_dir.mkdir(parents=True, exist_ok=True)
         timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -114,8 +125,8 @@ def main() -> int:
     if not config.exists():
         fail(
             f"missing {config}: declare the repository's quality gates (build, lint, "
-            "typecheck, ...) there, or declare an explicitly empty `gates: []` list "
-            "with a reason comment as a versioned decision"
+            "typecheck, ...) there, or declare `gates: []` with a concrete "
+            "empty_reason as a versioned decision"
         )
 
     gates = parse_gates(config)

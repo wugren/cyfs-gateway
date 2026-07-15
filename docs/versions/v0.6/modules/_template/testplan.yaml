@@ -1,16 +1,68 @@
 schema_version: 1
+# Optional post-implementation test metadata. Generate after production code exists.
 version: v0.6
 module: example-module
+task_name: 001-example-task
+submodule:
+api_impact:
+  public_api: none
+  crate_root_export_change: false
+  build_surface_change: false
+  documentation_examples_affected: false
+# Exact files or directories whose current content binds the run artifact. Risk-triggered
+# API/build-surface tasks must include production scope, repository consumers, fixtures,
+# test code, and documentation examples. testplan.yaml itself is always included.
+evidence_inputs: ["src"]
+contract_checks:
+  mode: disabled
+  reason: no breaking API, crate-root export, build-surface, or documentation-example impact
+  steps: []
+# Risk-triggered example (enable only the kinds required by API/build impact):
+# contract_checks:
+#   mode: enabled
+#   steps:
+#     - id: external-new-path
+#       kind: external-positive
+#       assertion: new-path-compiles
+#       name: compile an external consumer using the new path
+#       change_ids: ["CHG-example"]
+#       run: ["<tool>", "<positive-consumer-args>"]
+#     - id: external-old-path
+#       kind: external-negative
+#       assertion: old-path-rejected-for-removed-symbol
+#       name: prove the removed path fails for the expected symbol reason
+#       change_ids: ["CHG-example"]
+#       run: ["<tool>", "<negative-consumer-wrapper-args>"]
+#     - id: removed-symbol-scan
+#       kind: removed-symbol-scan
+#       assertion: no-unallowlisted-old-symbol-references
+#       name: fail on unallowlisted repository references to removed symbols
+#       change_ids: ["CHG-example"]
+#       run: ["uv", "run", "--active", "python", "./harness/scripts/consumer-closure-check.py", "--version", "v0.6", "--module", "example-module", "--task-name", "001-example-task"]
+#     - id: repository-compile-closure
+#       kind: repository-compile-closure
+#       assertion: repository-consumers-compile
+#       name: compile affected repository consumers without running tests
+#       change_ids: ["CHG-example"]
+#       run: ["cargo", "test", "-p", "<package>", "--no-run", "--all-targets"]
+#     - id: documentation-examples
+#       kind: documentation-examples
+#       assertion: documentation-examples-compile
+#       name: compile and run doctests or a repository-defined README compile fixture
+#       change_ids: ["CHG-example"]
+#       run: ["cargo", "test", "-p", "<package>", "--doc"]
 defaults:
   workdir: .
   timeout_sec: 600
   env: {}
+# Level contracts per harness/rules/test-design-rules.md: unit = every changed-code branch,
+# dv = module lifecycle + main + failure workflows, integration = per-interface success + failure semantics.
 levels:
   unit:
     mode: enabled
-    summary: 核心逻辑与子模块单元测试
+    summary: core logic and submodule unit tests
     test_targets:
-      - src/components/<component>/src
+      - tests/unit/example-module
     preconditions:
       tools: []
       env: []
@@ -18,15 +70,15 @@ levels:
       notes: []
     steps:
       - id: example-unit
-        name: 执行单元测试
-        change_ids: ["P-example-change"]
-        run: ["bash", "-lc", "cd src && cargo test -p <crate> <filter> -- --test-threads=1"]
+        name: run unit tests
+        change_ids: ["CHG-example"]
+        run: ["<tool>", "<args>"]
 
   dv:
     mode: enabled
-    summary: 单模块可运行验证
+    summary: single-module runnable verification
     test_targets:
-      - src/apps/<app>/tests
+      - tests/dv/example-module
     preconditions:
       tools: []
       env: []
@@ -34,15 +86,15 @@ levels:
       notes: []
     steps:
       - id: example-dv
-        name: 执行 DV 测试
-        change_ids: ["P-example-change"]
-        run: ["bash", "-lc", "cd src && cargo test -p <crate> --test <test-target> -- --test-threads=1"]
+        name: run dv tests
+        change_ids: ["CHG-example"]
+        run: ["<tool>", "<args>"]
 
   integration:
     mode: enabled
-    summary: 邻接模块集成验证
+    summary: neighbor-module integration verification
     test_targets:
-      - src/apps/<app>/tests
+      - tests/integration/example-module
     preconditions:
       tools: []
       env: []
@@ -50,6 +102,6 @@ levels:
       notes: []
     steps:
       - id: example-integration
-        name: 执行集成测试
-        change_ids: ["P-example-change"]
-        run: ["bash", "-lc", "cd src && cargo test -p <crate> --test <test-target> -- --test-threads=1"]
+        name: run integration tests
+        change_ids: ["CHG-example"]
+        run: ["<tool>", "<args>"]

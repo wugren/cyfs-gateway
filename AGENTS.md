@@ -1,119 +1,113 @@
 # Agent Guide (cyfs-gateway)
 
-当前 Beta2.2 是 breaking-change 版本。
+当前 Beta2.2 是 breaking-change 版本。本仓库采用分层 Harness Engineering；本文件只做导航，详细约束位于 `harness/` 与 `docs/`。
 
-本仓库采用分层 Harness Engineering 结构。`AGENTS.md` 只做导航，不承载完整规则细节。
+## Harness 规则启用
+
+- `harness/` 下的规则默认全部生效。
+- 当前用户可以明确要求对其点名的范围跳过全部 Harness 规则；若未点名范围，只对当前任务生效。
+- 该 opt-out 必须在其他 Harness 规则前判断，不能从“尽快处理”、一般性继续请求、沉默或紧急程度推断。
+- 跳过 Harness 规则不覆盖 system/developer 指令、安全要求、用户仍保留的范围约束或非 Harness 仓库约束。
 
 ## 规则优先级
-当规则冲突时按以下顺序解释，数字越小优先级越高：
-1. 当前任务中的明确用户指令。用户指令可选择阶段、模式和范围，但不能绕过 approval provenance、implementation admission、stage scope、validation 和 acceptance review 等机械门禁。
-2. `harness/rules/task-entry-gate-rules.md`：任务分类、准入和批准权限。
-3. 当前阶段对应的 `harness/rules/*.md`。
-4. `harness/custom-rules/` 下的项目自定义规则；custom rules 只能加严，不能放宽或绕过 generated gates。
-5. 模块包文档和长期架构文档。
 
-若按上述顺序仍存在真实矛盾，停止并向用户报告，不静默选择一边。
+发生冲突时按以下顺序解释，数字越小优先级越高：
+
+1. 当前任务中的明确用户指令；除非用户明确启用上述全规则 opt-out，否则用户指令只选择阶段、模式与范围，不能绕过机械门禁。
+2. 仅在用户明确启动 auto-pipeline 时，`harness/rules/auto-pipeline-rules.md` 对“不生成 `design.md` / `testing.md`、改用 task-local pipeline plan/state”具有窄范围优先级；其他门禁不放宽。
+3. `harness/rules/task-entry-gate-rules.md`：任务分类、准入、批准权限与 task packet 选择。
+4. 当前阶段对应的 `harness/rules/*.md`。
+5. `harness/custom-rules/` 下的项目自定义规则；custom rules 只能加严，不能放宽 generated gates。
+6. 当前 task packet、长期模块文档与架构文档。
+
+若仍存在真实矛盾，停止并报告，不静默选择一边。
 
 ## 首次读取顺序
-1. `harness/rules/task-entry-gate-rules.md`
-2. `docs/architecture/repository-baseline.md`
-3. `docs/architecture/module-map.md`
-4. `docs/modules/<module>.md`
-5. `docs/versions/v0.6/modules/<module>/proposal.md`
-6. `docs/versions/v0.6/modules/<module>/design.md`
-7. `docs/versions/v0.6/modules/<module>/testing.md`
-8. `docs/versions/v0.6/modules/<module>/testplan.yaml`
-9. `docs/versions/v0.6/modules/<module>/acceptance.md`
-10. `harness/rules/*.md`
-11. `harness/process_rules/*.md`
+
+1. `AGENTS.md`
+2. `harness/rules/task-entry-gate-rules.md`
+3. `docs/versions/<version>/modules/tasks.md`
+4. 当前 task packet：
+   - 单项目：`docs/versions/<version>/modules/<project>/<task-seq>-<task-slug>/`
+   - 跨项目：`docs/versions/<version>/modules/globals/<task-seq>-<task-slug>/`
+5. `docs/modules/<module>.md`
+6. 与任务相关的 `docs/architecture/` 文档
+7. 当前阶段的 `harness/rules/*.md`
+8. 匹配任务的 `harness/custom-rules/*.md` 与 `harness/process_rules/*.md`
+
+不要因为规则文件存在就进入 auto-pipeline；只有用户明确要求 enable / launch / run / enter automatic pipeline 时才读取并执行其模式规则。
 
 ## 任务决策流
-1. 用户是否明确指定 proposal / design / testing / implementation / acceptance 阶段？若是，只进入该阶段写入范围。
-2. 请求是否增删、收窄、放宽或重分类需求、范围、非目标、支持/不支持行为或验收边界？若是，默认进入 proposal 阶段。
-3. 请求是否会修改生产代码、构建、运行时资源或行为？若是，先定位 module packet，读取已批准的 `proposal.md` 和 `design.md`，创建 admission evidence，并通过 `schema-check.py` 与 `admission-check.py` 后再改代码。
-4. 任何门禁失败时，返回最早缺失或未覆盖的文档阶段，不从聊天上下文直接实现。
-5. 单阶段任务结束前运行 `stage-scope-check.py`，确认 diff 未越界。
 
-| 阶段 | 写入范围 | 完成前检查 |
-|------|----------|------------|
-| Proposal | 当前 packet 的 `proposal.md` | `doc-structure-check.py --docs proposal`；`stage-scope-check.py --stage proposal --version <v> --module <m>` |
-| Design | `design.md`、`design/`、必要的长期边界同步 | `doc-structure-check.py --docs design`；`stage-scope-check.py --stage design --version <v> --module <m>` |
-| Implementation | 生产代码、必要非测试运行时/构建资源、当前任务 admission evidence | 修改前通过 `harness/scripts/schema-check.py` 与 `harness/scripts/admission-check.py --evidence-file ...`；修改后 `stage-scope-check.py --stage implementation --change-id <id>` |
-| Testing | 测试代码、fixtures、runner、统一入口 wiring、testing artifacts | `doc-structure-check.py --docs testing`；`testing-coverage-check.py`；`test-run.py <module> all`；`stage-scope-check.py --stage testing` |
-| Acceptance | review report 与验收证据 | 按 `acceptance-review-rules.md` 运行检查，引用 test/quality run artifacts，并用 `acceptance-report-check.py` 校验报告 |
+1. 用户是否明确指定 proposal / design / testing / acceptance 阶段？若是，只进入该阶段写入范围。
+2. 请求是否增删、收窄、放宽或重分类需求、范围、非目标、支持/不支持行为或验收边界？若是，默认进入 proposal。
+3. 新需求、新 API、新 `change_id`、范围扩展或已批准内容修正是否针对 approved packet？若是，新建序号化 sibling task；修正使用 amendment/fix task，不能改写 approved packet。
+4. 请求是否会改生产代码、构建或运行时资源？若是，先定位 packet，读取 proposal 与 active design source，创建 admission evidence，并通过 schema/admission gate。
+5. 任何门禁失败时，返回最早缺失或未覆盖的文档阶段，不从聊天、旧实现或模块概览直接实现。
+6. 单阶段任务用当前任务专属的 `.paths` 清单与 sidecar 运行 stage-scope；无关 dirty-worktree 路径不属于该任务清单。
+7. checker 的输入未变化时复用最近通过结果；阶段切换、acceptance、commit、CI 或报告生成本身不触发重跑。
+
+| 阶段 | 职责与写入范围 | 完成前检查 |
+|------|----------------|------------|
+| Proposal | 把用户意图变成可批准的目标、范围、非目标、约束与成功标准；只写当前 packet 的 `proposal.md` 和 unfinished-task 索引 | `doc-structure-check.py --docs proposal`；task-manifest `stage-scope-check.py --stage proposal` |
+| Design | 把 proposal 变成可实现的模块关系、接口、状态所有权、流程、Scope Paths 与文件级顺序；manual flow 写 `design.md` / `design/` | manual flow 运行 `doc-structure-check.py --docs design`；task-manifest stage scope |
+| Implementation | 交付满足批准输入的最小生产代码与必要非测试运行时/构建资源 | 修改前通过 `schema-check.py`、`admission-check.py --evidence-file ...`；修改后按 `change_id` 与 Scope Paths 运行 stage scope |
+| Testing | implementation 后从 proposal、design 与代码设计用例并实现测试；写测试、fixtures、runner、task `testplan.yaml` 与 task run artifact | 可选 `testing.md` 存在时运行 doc structure；运行 `testing-coverage-check.py`、`test-run.py <module>/<task-name> all`、task-manifest stage scope |
+| Acceptance | 定义当前验收范围，审计文档、代码、测试设计、结果与实现正确性；只写 task packet 的 review report/必要状态 | 复用已有 task evidence；运行 `acceptance-report-check.py <report>` |
+
+## Task Packet 与证据
+
+- 新 task 名称必须是版本内序号化的 `<task-seq>-<task-slug>`；创建前运行：
+  `UV_CACHE_DIR=.harness/uv-cache uv run --active python ./harness/scripts/task-seq.py next --version <version> --slug <task-slug>`
+- `docs/versions/<version>/modules/tasks.md` 只记录未完成 task；序号仅表示创建顺序，不表示 current/latest。
+- current/latest 只能来自当前用户明确指向，或 `docs/modules/<module>.md` 的 Current/Active Task。
+- task packet checker 使用 `--submodule <task-seq>-<task-slug>`。
+- implementation admission evidence 位于 `docs/versions/<version>/evidence/admission/<YYYYMMDD>-<task-slug>.md`。
+- stage scope 清单位于 `docs/versions/<version>/evidence/stage-scope/<task-id>.paths`，并带 `.paths.meta.json` sidecar。
+- Rust testing 若改已有 `#[cfg(test)]` item，修改前用 `baseline-snapshot.py` 将文件保存到 git-ignored `.harness/baselines/<task-id>/`；禁止用临时 Git index/tree/commit 伪造 baseline。
+- agent 不得自行把阶段文档设为 approved。用户批准必须记录 `## Approval Record` 与内容哈希；auto-pipeline 批准必须绑定用户逐字 launch 证据。
 
 ## 仓库地图
+
 - Rust 工作区：`src/`
 - 主服务：`src/apps/cyfs_gateway/`
 - 核心库：`src/components/cyfs-gateway-lib/`
 - Web 控制台：`src/apps/cyfs_gateway/web/`
 - 运行时配置：`src/rootfs/etc/`
 - 历史资料：`doc/`
-- 项目级基线：`docs/architecture/`
+- 项目级架构：`docs/architecture/`
 - 长期模块边界：`docs/modules/`
-- 版本化模块包：`docs/versions/v0.6/modules/`
-- 验收报告：`docs/versions/v0.6/reviews/`
-- Durable harness 规则：`harness/rules/`
-- 项目自定义规则：`harness/custom-rules/`
-- 执行流程与任务模板：`harness/process_rules/`
-- 人审与分级：`harness/human-rules/`、`harness/checklists/`
+- 版本化 task packets：`docs/versions/v0.6/modules/`
+- Durable generated rules：`harness/rules/`
+- 用户自定义规则：`harness/custom-rules/`
+- 流程与任务模板：`harness/process_rules/`
+- 统一检查器：`harness/scripts/`
+- 本地 Harness 状态：`.harness/`（git ignored）
+- 测试与质量 run artifacts：`test-results/`（git ignored）
 
-## 阶段职责
-- Proposal：定义目标、范围、非目标和约束，输出 `proposal.md`
-- Design：定义实现形态、子模块、接口和路径归属，输出 `design.md`
-- Testing：在 implementation 后定义验证覆盖、补充测试实现、证据路径和 `testplan.yaml`
-- Implementation：只修改生产代码与必要的非测试运行时/构建资源
-- Acceptance：审计证据链并输出独立验收报告
+## 关键入口
 
-## 阶段边界
-- Implementation 开始前，`proposal.md`、`design.md` 必须存在且处于批准态。
-- 批准态不是充分条件；implementation 必须确认已批准文档直接覆盖当前变更。
-- 若当前变更无法映射到 proposal / design 的具体条目，必须回退到对应文档阶段补充；测试覆盖不足在 implementation 后回到 testing 阶段补充。
-- 单阶段任务收尾前运行 `python3 ./harness/scripts/stage-scope-check.py --stage <stage>`，确认 diff 没有越过阶段边界。
-- Acceptance 只写报告，不在原任务里修代码或补上游文档。
-
-## 关键规则入口
-- 任务入口规则：`harness/rules/task-entry-gate-rules.md`
-- Proposal 规则：`harness/rules/proposal-doc-rules.md`
-- Design 规则：`harness/rules/design-doc-rules.md`
-- Rust Design 附加规则：`harness/rules/rust-design-doc-rules.md`
-- Testing 规则：`harness/rules/testing-doc-rules.md`
-- 模块包约束：`harness/rules/module-packet-rules.md`
-- Implementation 准入：`harness/rules/implementation-admission-rules.md`
-- Schema 校验：`harness/rules/schema-validation-rules.md`
-- 验收规则：`harness/rules/acceptance-task-rules.md`
-- 验收 Review Gate：`harness/rules/acceptance-review-rules.md`
+- 任务入口：`harness/rules/task-entry-gate-rules.md`
+- Proposal：`harness/rules/proposal-doc-rules.md`
+- Design：`harness/rules/design-doc-rules.md`
+- Testing：`harness/rules/testing-doc-rules.md`、`harness/rules/test-design-rules.md`
+- Implementation admission：`harness/rules/implementation-admission-rules.md`
+- Schema：`harness/rules/schema-validation-rules.md`
+- Acceptance：`harness/rules/acceptance-task-rules.md`、`harness/rules/acceptance-review-rules.md`
+- 统一测试：`harness/rules/unified-test-entry-rules.md`
 - 触发式加严：`harness/rules/trigger-rules.md`
-- 质量门规则：`harness/rules/quality-gate-rules.md`
-- 配置模板同步：`harness/custom-rules/config-template-sync-rules.md`
-- 禁止全局 Rust 格式化：`harness/custom-rules/no-global-cargo-fmt-rules.md`
-- 任务后聚焦测试：`harness/custom-rules/focused-post-task-test-rules.md`
-- 统一测试入口：`harness/rules/unified-test-entry-rules.md`
-- Auto-pipeline：`harness/rules/auto-pipeline-rules.md`
-- 模块交付循环：`harness/process_rules/module-delivery-loop.md`
-- 全仓 harness 检查：`harness/scripts/check-all.py`
-
-## 标准命令
-- Rust 构建：`cd src && cargo build --verbose`
-- Rust 全量测试：`cd src && cargo test -- --test-threads=1`
-- Web 构建：`cd src/apps/cyfs_gateway/web && npm run build`
-- 统一测试入口：
-  - `python3 ./harness/scripts/test-run.py <module> unit`
-  - `python3 ./harness/scripts/test-run.py <module> dv`
-  - `python3 ./harness/scripts/test-run.py <module> integration`
-  - `python3 ./harness/scripts/test-run.py <module> all`
-  - `python3 ./harness/scripts/test-run.py all all`
-  - `./test-run.sh all all`
-  - `test-run.bat all all`
-- 质量门：`python3 ./harness/scripts/quality-check.py`
-- 全仓 Harness 检查：`python3 ./harness/scripts/check-all.py`
+- 质量门：`harness/rules/quality-gate-rules.md`
+- Schema checker：`harness/scripts/schema-check.py`
+- Admission checker：`harness/scripts/admission-check.py`
+- Stage-scope checker：`harness/scripts/stage-scope-check.py`
+- 全仓 scaffold 审计：`UV_CACHE_DIR=.harness/uv-cache uv run --active python ./harness/scripts/check-all.py`
 
 ## 仓库约束
-- 优先做小而局部的改动，不把 bugfix 和重构混在一起。
-- Rust 测试默认使用单线程，尤其是涉及端口、共享状态或运行时启动时。
-- agent 不执行全局 `cargo fmt`；详见 `harness/custom-rules/no-global-cargo-fmt-rules.md`。
-- 任务完成后的验证默认只运行与本次修改直接相关的聚焦测试或检查；不要把全量测试作为普通任务收尾动作，详见 `harness/custom-rules/focused-post-task-test-rules.md`。
-- 配置、控制平面、运行时组装、process-chain、SN/DNS/RTCP 和 UI 契约改动，先看 `trigger-rules.md` 再决定附加验证。
-- `doc/` 是历史资料和参考资料层；harness 事实来源是 `docs/` 和 `harness/`。历史资料可作为输入引用，但不能单独作为 implementation admission 证据。
-- `harness/rules/` 是 skill-managed generated rules；项目自定义规则只放在 `harness/custom-rules/`，刷新 harness 时不得修改 custom rules，除非用户明确要求。
-- Auto-pipeline 规则默认存在但不自动启用；只有用户明确要求启用、启动、运行或进入 automatic pipeline 时才读取并执行。
+
+- 优先小而局部的改动，不把 bugfix 与重构混在一起。
+- Rust 测试默认单线程，尤其涉及端口、共享状态或运行时启动时。
+- agent 不自动运行全局 `cargo fmt`；遵循 `harness/custom-rules/no-global-cargo-fmt-rules.md`。
+- 配置契约变更遵循 `harness/custom-rules/config-template-sync-rules.md`。
+- `harness/rules/` 是 skill-managed generated rules；刷新不得修改、删除、重命名或重排 `harness/custom-rules/`。
+- `doc/` 只作历史参考；Harness 事实来源是 `docs/` 与 `harness/`。
+- 单 task 测试、acceptance 与 auto-pipeline 只调用 `<module>/<task-name> all`；module suites、`all all`、root shortcuts 与 quality gates 仅供用户明确发起的 maintenance。

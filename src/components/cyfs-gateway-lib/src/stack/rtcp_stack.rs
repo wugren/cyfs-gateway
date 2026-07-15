@@ -2648,7 +2648,7 @@ mod tests {
             DeviceConfig::new_by_jwk("logical-test", serde_json::from_value(jwk).unwrap());
         device_config.id = DID::new("web", "logical.example.com");
 
-        let result = RtcpStack::builder()
+        let result = rtcp_stack_builder()
             .id("logical-test")
             .bind("127.0.0.1:0".to_string())
             .device_config(device_config)

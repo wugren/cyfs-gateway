@@ -1,0 +1,77 @@
+schema_version: 1
+version: v0.6
+module: gateway-runtime
+task_name: 001-http-upstreams-merge
+submodule: 001-http-upstreams-merge
+defaults:
+  workdir: .
+  timeout_sec: 1800
+  env: {}
+api_impact:
+  public_api: backward-compatible
+  crate_root_export_change: false
+  build_surface_change: true
+  documentation_examples_affected: false
+evidence_inputs: ["src/components/cyfs-gateway-lib/Cargo.toml", "src/components/cyfs-gateway-lib/src/cmds/forward.rs", "src/components/cyfs-gateway-lib/src/server/mod.rs", "src/components/cyfs-gateway-lib/src/server/server.rs", "src/components/cyfs-gateway-lib/src/server/http_server.rs", "src/apps/cyfs_gateway/src/gateway.rs", "tests/integration/cyfs_gateway_app/run.py"]
+contract_checks:
+  mode: enabled
+  reason: The merge changes the cyfs-gateway-lib dependency/build surface.
+  steps:
+    - id: repository-compile-closure
+      kind: repository-compile-closure
+      assertion: repository-consumers-compile
+      name: Compile all cyfs-gateway-lib targets and consumers
+      change_ids: ["P-http-upstreams-1"]
+      run: ["cargo", "test", "--manifest-path", "src/Cargo.toml", "-p", "cyfs-gateway-lib", "--no-run", "--all-targets"]
+levels:
+  unit:
+    mode: enabled
+    summary: Branch-level HTTP upstream, named token, and generated-router compatibility coverage.
+    test_targets: ["src/components/cyfs-gateway-lib/src/server/http_server.rs", "src/components/cyfs-gateway-lib/src/cmds/forward.rs", "src/apps/cyfs_gateway/src/gateway.rs"]
+    preconditions:
+      tools: ["cargo"]
+      env: []
+      services: []
+      notes: ["Tests run serially where runtime ports or local tasks are involved."]
+    steps:
+      - id: http-upstreams-unit
+        name: Execute HTTP upstream and current-branch compatibility regressions
+        change_ids: ["P-http-upstreams-1"]
+        run: ["bash", "-lc", "cd src && cargo test -p cyfs-gateway-lib server::http_server::tests::test_ -- --test-threads=1"]
+      - id: named-forward-token
+        name: Execute named forward token regression
+        change_ids: ["P-http-upstreams-1"]
+        run: ["bash", "-lc", "cd src && cargo test -p cyfs-gateway-lib test_parse_upstream_accepts_named_token -- --test-threads=1"]
+      - id: dynamic-router-host
+        name: Execute generated router Host compatibility regression
+        change_ids: ["P-http-upstreams-1"]
+        run: ["bash", "-lc", "cd src && cargo test -p cyfs_gateway test_add_and_remove_router_to_config -- --test-threads=1"]
+  dv:
+    mode: disabled
+    summary: The changed HTTP server has no independent binary lifecycle; assembled behavior is covered by loopback unit and gateway integration levels.
+    change_ids: ["P-http-upstreams-1"]
+    reason: No separate single-module executable exists between the server builder tests and the consuming gateway integration.
+    test_targets: ["src/components/cyfs-gateway-lib/src/server/http_server.rs"]
+    preconditions:
+      tools: []
+      env: []
+      services: []
+      notes: ["Lifecycle, configuration variants, and failure workflows execute in the loopback HTTP server tests."]
+  integration:
+    mode: enabled
+    summary: Cross-module gateway routing and process-level configuration compatibility.
+    test_targets: ["src/apps/cyfs_gateway/tests/test_cyfs_gateway.rs", "tests/integration/cyfs_gateway_app/run.py"]
+    preconditions:
+      tools: ["cargo", "python3"]
+      env: []
+      services: []
+      notes: ["All dependencies use loopback services created by the tests."]
+    steps:
+      - id: gateway-routing-integration
+        name: Execute gateway routing integration including dynamic virtual Host forwarding
+        change_ids: ["P-http-upstreams-1"]
+        run: ["bash", "-lc", "cd src && cargo test -p cyfs_gateway --test test_cyfs_gateway -- --test-threads=1"]
+      - id: gateway-app-process-integration
+        name: Execute process-level gateway configuration and transport integrations
+        change_ids: ["P-http-upstreams-1"]
+        run: ["bash", "-lc", "python3 tests/integration/cyfs_gateway_app/run.py"]

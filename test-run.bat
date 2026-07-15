@@ -11,6 +11,8 @@ if errorlevel 1 (
 )
 
 set "UV_PROJECT_ENVIRONMENT=.venv"
+set "UV_CACHE_DIR=%CD%\.harness\uv-cache"
+if not exist "%UV_CACHE_DIR%" mkdir "%UV_CACHE_DIR%"
 set "VENV_PYTHON=.venv\Scripts\python.exe"
 
 if not exist "%VENV_PYTHON%" (

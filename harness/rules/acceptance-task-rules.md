@@ -4,61 +4,51 @@
 - Define how acceptance evaluates evidence and records outcomes.
 
 ## Scope
-- optional `acceptance.md`
-- review reports under `docs/versions/<version>/reviews/`
+- Optional `acceptance.md`.
+- Acceptance result reports under the active task packet, by default `docs/versions/<version>/modules/<module>/<task-seq>-<task-slug>/acceptance-report.md` or `docs/versions/<version>/modules/globals/<task-seq>-<task-slug>/acceptance-report.md` for cross-project work.
 
 ## Required Inputs
-- `proposal.md`
-- `design.md` and `design/`
-- testing implementation, test fixtures, test runners, and optional `testing.md`, `testing/`, or `testplan.yaml`
-- direct submodule packets under `docs/versions/<version>/modules/<module>/<submodule>/` when the work is split by submodule
-- optional `acceptance.md`
-- long-lived module docs
-- implementation
-- test code
-- test results
-- optional git diff/status evidence when useful for locating changed files
-- `harness/rules/acceptance-review-rules.md`
+- Active task packet proposal/design, optional testing/acceptance artifacts, implementation, tests, and test results relevant to the reviewed `change_id` values and affected paths.
+- Long-lived module docs and relevant project-wide docs under `docs/architecture/` only when repo-local project rules or task evidence make them applicable.
+- Optional git diff/status evidence when useful for locating changed files.
+- `harness/rules/acceptance-review-rules.md`.
 
 ## Acceptance Rule
-- Acceptance evaluates consistency across the entire evidence chain.
-- Acceptance MUST apply `harness/rules/acceptance-review-rules.md` and judge whether the documents' described behavior is implemented and internally coherent.
-- Git diff/status output is not the acceptance standard. Diff noise, unrelated churn, or `git diff --check` output should not decide acceptance unless it exposes a document inconsistency, document-to-implementation mismatch, missing approved behavior, or logical defect.
-- Acceptance MUST check consistency between proposal, design, code implementation, and test implementation.
-- If consistency problems exist, the approved `proposal.md` is authoritative.
-- Subject to satisfying the approved proposal, acceptance MUST route non-requirement fixes through design -> implementation/code -> testing implementation.
-- Optional testing documents MUST conform to design documents; code MUST conform to design; tests MUST verify proposal/design/code behavior.
-- Acceptance MUST write a standalone review report instead of editing implementation or stage docs.
-- Acceptance MUST NOT directly edit `proposal.md`, `design.md`, `design/`, `testing.md`, `testing/`, `testplan.yaml`, code, or test code unless the user explicitly requested a separate cross-stage update task.
-- Acceptance MUST identify the owning stage for each blocking mismatch.
-- Acceptance MUST verify that the reviewed change maps back to direct proposal and design items, not only to module-overview or baseline text.
-- Acceptance MUST verify that reviewed implementation changes map to stable `change_id` values across proposal and design, and that testing implementation covers those `change_id` values or records an explicit gap.
-- Acceptance MUST verify every module needed as evidence for accepted behavior has approved, directly mapped proposal/design coverage and post-implementation testing evidence.
-- Acceptance MUST verify every direct submodule packet needed as evidence for accepted behavior has approved, directly mapped proposal/design coverage and post-implementation testing evidence.
-- Acceptance MUST verify completed testing work includes `testplan.yaml`, unless a repo-local versioned exception records the reason, owner, risk, and acceptance impact.
-- Acceptance MUST verify that post-implementation test design is reasonable for proposal/design/code behavior and covers normal, boundary, negative, error, compatibility, lifecycle, and cross-module cases where applicable.
-- Acceptance MUST verify that test design and test implementation coverage map to reviewed `change_id` values, or that explicit gaps are recorded with a reason.
-- Acceptance MUST verify that automated test evidence is reachable through the unified test entrypoint `harness/scripts/test-run.py`, and that whole-project tests can be invoked through `test-run.py all all`.
-- Acceptance MUST cite machine-written run artifacts as execution evidence: `harness/evidence/test-runs/*.json` for test runs and `harness/evidence/quality-runs/*.json` for quality gates; claimed runs without an artifact are missing evidence.
-- Acceptance MUST run `uv run --active python ./harness/scripts/quality-check.py` and treat failing or unrun configured quality gates as blocking; see `harness/rules/quality-gate-rules.md`.
-- Acceptance MUST verify red-green regression evidence for reviewed bugfix work: a regression test bound to the bugfix `change_id` with a failing pre-fix run artifact or a recorded concrete infeasibility reason.
-- Acceptance MUST verify the implementation diff was bound to the admitted design Scope Paths via `stage-scope-check.py --stage implementation --change-id ...`.
-- Acceptance MUST treat missing or ambiguous active module / `change_id` evidence as a blocking admission failure.
-- Acceptance MUST treat missing or ambiguous active submodule evidence as a blocking admission failure when the change belongs to a direct submodule packet.
-- Acceptance MUST NOT mark the work as passed when required evidence is missing.
-- Acceptance MUST NOT mark the work as passed only because tests passed.
-- Acceptance MUST generate or finalize acceptance rules and expected results from `proposal.md`, `design.md`, implementation, and testing implementation before judging pass/fail.
-- Acceptance MUST run `uv run --active python ./harness/scripts/acceptance-report-check.py <report>` before marking the report complete.
-- An `accepted` conclusion is invalid when `acceptance-report-check.py` fails.
+- Acceptance first defines the task-relevant acceptance scope: reviewed `change_id` values, active task packet, affected module paths, and evidence-bearing modules.
+- Acceptance evaluates only the evidence chain relevant to that scope and MUST apply `harness/rules/acceptance-review-rules.md`.
+- Acceptance MUST execute only task-scoped automated tests. Direct package/module runtime suites, whole-project suites, root shortcuts, and quality-gate commands are forbidden in single-task acceptance; changes under `harness/**` or `docs/**` never trigger them.
+- Risk-triggered API/build-surface tasks remain task-scoped: acceptance invokes only `<module>/<task-name> all`, whose task-local plan may contain the required package/workspace compile-only consumer closure. The exception never authorizes broad runtime test execution.
+- Git diff/status output is discovery evidence only, not the acceptance standard.
+- Acceptance MUST check consistency between proposal, design, relevant project-rule-governed `docs/architecture/` docs when applicable, implementation, testing implementation, generated acceptance rules, and expected results.
+- Approved `proposal.md` is authoritative when downstream artifacts conflict.
+- Subject to the proposal, non-requirement fixes route design -> implementation/code -> testing implementation.
+- Acceptance writes a standalone review report and MUST NOT edit stage docs, code, or tests unless the user explicitly requested a separate cross-stage update task.
+- Auto-pipeline acceptance MUST NOT create `acceptance.md` by default; it records final acceptance in task-local `pipeline/state.json` and the task-packet `acceptance-report.md`.
+- Each blocking mismatch MUST identify its owning stage.
+- Reviewed behavior MUST map to direct proposal/design items and stable `change_id` values, not only module overviews.
+- Every evidence-bearing module or task packet MUST have approved directly mapped proposal/design coverage, project-rule-governed `docs/architecture/` evidence where applicable, and post-implementation testing evidence.
+- Completed testing work MUST include `testplan.yaml` unless a versioned exception records reason, owner, risk, and acceptance impact.
+- Acceptance MUST judge post-implementation test design adequacy for proposal/design/code behavior, including relevant normal, boundary, negative, error, compatibility, lifecycle, and cross-module cases.
+- Acceptance MUST perform and record an implementation correctness audit beyond test pass/fail. It MUST cover logic/control flow, termination/progress, concurrency/synchronization, resource lifetime/cleanup, state/data integrity, error handling/recovery, interface boundaries/compatibility, and security/capacity safety; every category needs inspected evidence and either pass, a concrete finding, or a concrete not-applicable reason.
+- Automated test evidence MUST be reachable through `harness/scripts/test-run.py`; reuse the existing `<module>/<task-name> all` artifact while implementation, tests, testplan, and registration are unchanged, and rerun only after one of those inputs changes.
+- Execution evidence MUST cite a machine-written `test-results/test-runs/*.json` artifact matching `<module>/<task-name> all` and the reviewed `change_id` values. Artifacts MUST NOT carry or be validated by a repository/package state hash.
+- Risk-triggered API/build-surface artifacts instead carry explicit evidence-input roots, their expanded files, and `evidence_input_sha256`; acceptance re-expands and rehashes that scoped closure so new or modified consumer inputs invalidate stale evidence.
+- When no automated task run can apply, acceptance MUST replace the run artifact with a structured `## Automated Test Exception` containing `Applies: yes`, a concrete reason, owner, risk, acceptance impact, and alternative evidence; `not applicable` alone is not sufficient.
+- Quality gates are independent, explicitly user-invoked checks and are not acceptance-blocking single-task evidence.
+- Bugfix acceptance MUST verify red-green regression evidence or a concrete infeasibility reason.
+- Implementation task paths MUST be bound to admitted design `Scope Paths` through `stage-scope-check.py --stage implementation --change-id ... --changed-paths-file ...`.
+- Acceptance MUST cite the pre-existing admission stamp and MUST NOT replay implementation admission while its bound inputs are unchanged. A missing result returns to the owning stage; acceptance does not create or refresh admission evidence.
+- Missing active module, active task packet, `change_id`, or required evidence is blocking.
+- Passing tests alone never imply acceptance.
+- Before final judgment, reuse existing task-relevant validation. Run a gate again only after its owned inputs changed; run `acceptance-report-check.py` after the report itself is created or modified.
 
 ## Failure Handling
-- proposal mismatch: return to proposal
-- proposal-to-design mismatch: return to design unless the proposal itself is ambiguous or contradictory
-- design-to-code mismatch: return to implementation/code
-- missing, invalid, incomplete, ambiguous, stale, or unreasonable test design / test implementation coverage: return to testing
-- test evidence not reachable through the unified test entrypoint: return to testing
-- document-to-code mismatch: return to implementation/code
-- implementation defect: return to implementation
-- logic or consistency finding: return to the owning stage named by the finding
-- non-requirement findings: repeat design -> implementation -> testing implementation, then rerun acceptance
-- more than 5 unsuccessful iterations for the same unresolved issue: stop and report the issue to the user
+- Proposal ambiguity, contradiction, incorrect requirement, or incorrect acceptance boundary: stop acceptance and any auto-pipeline, report the issue, and ask the user to decide. Do not infer the requirement or open an automatic proposal return task.
+- Proposal-to-design mismatch or a missing/incorrect architecture, algorithm, state model, concurrency model, resource-lifetime model, interface contract, or failure strategy: return to design.
+- Design-to-code or document-to-code mismatch: return to implementation/code, or design when docs need synchronization.
+- Missing, invalid, stale, non-runnable, ambiguous, incomplete, or unreasonable test design / test implementation coverage: return to testing.
+- Project-rule-governed architecture-doc-to-code mismatch: return to design for doc sync or implementation when code violates approved design.
+- Implementation defect against an adequate design, including incorrect logic, non-termination, deadlock/race, resource leak, state corruption, error-path defect, or compatibility/security/capacity defect: return to implementation.
+- Logic or consistency finding: return to the owning stage named by the finding.
+- Non-requirement findings repeat design -> implementation -> testing implementation, then rerun acceptance.
+- More than 5 unsuccessful iterations for the same unresolved issue: stop and report the issue to the user.
